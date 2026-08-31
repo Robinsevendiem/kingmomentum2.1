@@ -82,7 +82,7 @@ macOS 也可以双击 `open_kingmomentum_app.command`。脚本会检查依赖、
 3. 使用 `requirements.txt` 安装依赖；
 4. 部署后检查“回测”“最新持仓”和“策略说明”三个页面。
 
-基础应用使用仓库内置数据快照，不需要 PandaData 账号即可运行回测。如果要启用“最新持仓 → 更新数据”，还需要部署环境能够安装并访问 PandaData SDK，并在 Streamlit 的 `Settings → Secrets` 中配置：
+基础应用使用仓库内置数据快照；“最新持仓 → 更新数据”会使用 `panda_data` SDK 从 PandaData 拉取增量数据，并在 Streamlit 的 `Settings → Secrets` 中读取以下配置：
 
 ```toml
 PANDA_DATA_USERNAME = "你的PandaData账号"
@@ -95,7 +95,7 @@ PANDA_DATA_PASSWORD = "你的PandaData密码"
 .streamlit/secrets.toml
 ```
 
-当前 `requirements.txt` 刻意不包含 `panda_data`，因为该 SDK 不一定能从公开 PyPI 安装。若部署环境无法安装 SDK，网页仍可使用内置数据快照，“更新数据”按钮会给出失败提示，不会伪造更新成功。
+`requirements.txt` 已包含 `panda_data>=0.0.12`，并将 NumPy 限制在 `<2.0` 以满足 SDK 依赖。如果部署环境安装依赖失败，网页仍可使用内置数据快照，但“更新数据”功能不可用；应先检查 Streamlit 的构建日志。
 
 ## 策略和数据边界
 
