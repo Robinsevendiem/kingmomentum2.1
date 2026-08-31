@@ -128,9 +128,15 @@ def position_management_snapshot(
     *,
     target_volatility: float | None = 0.20,
     rebalance_band: float = 0.10,
+    volatility_day: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    """Return the latest target-volatility position decision for display."""
-    estimated_volatility = portfolio_volatility(data, selected, signal_day)
+    """Return the target-volatility position decision for the next execution.
+
+    When a holding snapshot is viewed after a market close, ``volatility_day``
+    should be the next trading day so the estimate includes the latest close,
+    matching the backtest's next-open execution calculation.
+    """
+    estimated_volatility = portfolio_volatility(data, selected, volatility_day or signal_day)
     if not selected:
         target_exposure = 0.0
         status = "转入现金" if current_holdings else "持有现金"
@@ -410,9 +416,22 @@ def backtest(
     return metrics, value_frame.reset_index(), pd.DataFrame(holdings_rows), pd.DataFrame(rebalance_rows), trade_frame
 
 
-def latest_signal(data: dict[str, pd.DataFrame], scores: pd.DataFrame, *, top_n: int = 1, buffer: float = 5.0, cutoff: float = 500.0) -> tuple[pd.Timestamp, pd.DataFrame, list[str], str]:
+def latest_signal(
+    data: dict[str, pd.DataFrame],
+    scores: pd.DataFrame,
+    *,
+    top_n: int = 1,
+    buffer: float = 5.0,
+    cutoff: float = 500.0,
+    as_of: date | pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, pd.DataFrame, list[str], str]:
     latest = min(frame.index.max() for frame in data.values())
-    score_day = scores.index[scores.index <= latest][-1]
+    if as_of is not None:
+        latest = min(latest, pd.Timestamp(as_of))
+    available_scores = scores.index[scores.index <= latest]
+    if len(available_scores) == 0:
+        raise ValueError(f"{latest.date()} 之前没有可用的动量分数")
+    score_day = available_scores[-1]
     row = scores.loc[score_day].rename("动量分数").to_frame()
     row["名称"] = row.index.map(ASSETS)
     row["状态"] = np.select([row["动量分数"] <= 0, row["动量分数"] > cutoff], ["非正分", "过热"], default="有效候选")
