@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -422,6 +423,21 @@ def latest_signal(data: dict[str, pd.DataFrame], scores: pd.DataFrame, *, top_n:
     return score_day, row, selected, reason
 
 
+def _prepare_pandadata_runtime() -> None:
+    """让 PandaData 的认证缓存落在部署环境可写的临时目录。
+
+    panda_data 0.0.12 的 init_token() 会把加密认证状态写入 SDK 安装目录，
+    但 Streamlit Community Cloud 的虚拟环境目录是只读的。将其内部缓存目录
+    指向临时目录后，认证仍只在当前运行容器内保存，不会写入 GitHub 仓库。
+    """
+    import panda_data.auth_manager as auth_manager
+
+    runtime_dir = Path(tempfile.gettempdir()) / "kingmomentum_pandadata"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    # 0.0.12 没有公开的 user.json 路径配置；该变量由 SDK 的认证管理器使用。
+    auth_manager._user_json_dir = str(runtime_dir)
+
+
 def refresh_with_pandadata(data_dir: Path, username: str, password: str, start: date, end: date) -> tuple[int, str]:
     """Optional updater; requires PandaData credentials and SDK in deployment secrets."""
     try:
@@ -430,6 +446,7 @@ def refresh_with_pandadata(data_dir: Path, username: str, password: str, start: 
         raise RuntimeError("未安装 panda_data，请在 requirements.txt 中安装后重试") from exc
     if not username or not password:
         raise RuntimeError("请先配置 PANDA_DATA_USERNAME 和 PANDA_DATA_PASSWORD")
+    _prepare_pandadata_runtime()
     panda_data.init_token(username=username, password=password)
     updated = 0
     for symbol in ASSETS:
