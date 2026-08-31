@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -78,6 +78,24 @@ def resolve_symbol_input(value: str) -> str | None:
     code = normalized.zfill(6)
     matches = [symbol for symbol in ASSETS if symbol.endswith(f".{code}")]
     return matches[0] if len(matches) == 1 else None
+
+
+def parse_date_text(value: str) -> date | None:
+    """Parse a keyboard-entered date in common formats."""
+    text = value.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def next_trading_day(data: dict, day: pd.Timestamp) -> date | None:
+    """Return the next available market day after a signal day."""
+    dates = pd.DatetimeIndex(sorted(set().union(*[set(frame.index) for frame in data.values()])))
+    future = dates[dates > pd.Timestamp(day)]
+    return future[0].date() if len(future) else None
 
 
 def mode_settings(mode: str) -> dict[str, float | None]:
@@ -288,16 +306,37 @@ def main() -> None:
                 quick_range = st.radio("快捷日期", ["自定义", "最近1年", "最近2年", "最近3年", "最近5年"], index=2)
                 years = {"最近1年": 1, "最近2年": 2, "最近3年": 3, "最近5年": 5}
                 quick_start = max(EARLIEST_BACKTEST_START, (pd.Timestamp(common_end) - pd.DateOffset(years=years[quick_range])).date()) if quick_range != "自定义" else EARLIEST_BACKTEST_START
-                date_range = st.date_input("回测日期范围", value=(quick_start, common_end), min_value=EARLIEST_BACKTEST_START, max_value=common_end)
+                if quick_range == "自定义":
+                    st.caption("可直接键盘输入日期，支持 YYYY-MM-DD、YYYY/MM/DD 或 YYYYMMDD")
+                    date_input_cols = st.columns(2)
+                    with date_input_cols[0]:
+                        custom_start_text = st.text_input(
+                            "开始日期",
+                            value=str(EARLIEST_BACKTEST_START),
+                            key="custom_backtest_start_text",
+                        )
+                    with date_input_cols[1]:
+                        custom_end_text = st.text_input(
+                            "结束日期",
+                            value=str(common_end),
+                            key="custom_backtest_end_text",
+                        )
+                else:
+                    st.caption(f"快捷回测区间：{quick_start} 至 {common_end}")
+                    custom_start_text = ""
+                    custom_end_text = ""
                 start_backtest = st.form_submit_button("开始回测", type="primary", use_container_width=True)
 
         if start_backtest:
-            if not isinstance(date_range, tuple) or len(date_range) != 2:
-                st.error("请选择完整的起止日期")
+            if quick_range == "自定义":
+                start = parse_date_text(custom_start_text)
+                end = parse_date_text(custom_end_text)
+                if start is None or end is None:
+                    st.error("日期格式无法识别，请输入 YYYY-MM-DD，例如 2024-08-25")
+                    start = end = None
             else:
-                start, end = date_range
-                if quick_range != "自定义":
-                    start, end = quick_start, common_end
+                start, end = quick_start, common_end
+            if start is not None and end is not None:
                 if start < EARLIEST_BACKTEST_START:
                     st.error(f"起始日期不得早于 {EARLIEST_BACKTEST_START}")
                 elif start >= end:
@@ -309,6 +348,7 @@ def main() -> None:
                         "mode": mode,
                         "settings": settings,
                         "mode_label": mode_label,
+                        "date_mode": quick_range,
                         "data_signature": data_signature,
                     }
 
@@ -397,7 +437,20 @@ def main() -> None:
     elif page == "最新持仓":
         st.subheader("最新持仓与动量分数")
         latest_data_date = min(frame.index.max().date() for frame in data.values())
-        st.write(f"当前数据最新日期：**{latest_data_date}**。最新持仓使用各标的最近可用收盘数据计算。")
+        saved_request = st.session_state.get("backtest_request")
+        if saved_request is not None and saved_request.get("data_signature") != data_signature:
+            st.session_state.pop("backtest_request", None)
+            saved_request = None
+        use_custom_backtest_end = saved_request is not None and saved_request.get("date_mode") == "自定义"
+        analysis_start = saved_request["start"] if use_custom_backtest_end else EARLIEST_BACKTEST_START
+        analysis_end = saved_request["end"] if use_custom_backtest_end else common_end
+        if use_custom_backtest_end:
+            st.write(
+                f"当前数据最新日期：**{latest_data_date}**。已检测到最近一次自定义回测，"
+                f"本页将展示该回测区间 **{analysis_start} 至 {analysis_end}** 内最后一个交易日的持仓。"
+            )
+        else:
+            st.write(f"当前数据最新日期：**{latest_data_date}**。最新持仓使用各标的最近可用收盘数据计算。")
         latest_mode, latest_settings, latest_mode_label = position_mode_controls(st, "最新持仓仓位模式", "latest_position")
         c1, c2 = st.columns([1, 3])
         with c1:
@@ -414,11 +467,34 @@ def main() -> None:
                     st.error(f"更新失败：{exc}")
         with c2:
             st.caption("更新功能需要配置 PandaData 账号和可用SDK；未配置时，应用继续使用项目内置快照。建议先在本地验证更新后的数据覆盖与完整性。")
-        score_day, score_table, selected_holdings, reason = latest_signal(data, scores)
-        _, latest_nav, _, _, _ = backtest(data, scores, start=EARLIEST_BACKTEST_START, end=score_day.date(), **latest_settings)
+        score_day, score_table, selected_holdings, reason = latest_signal(data, scores, as_of=analysis_end)
+        full_metrics, latest_nav, _, _, _ = backtest(data, scores, start=analysis_start, end=analysis_end, **latest_settings)
+        holding_day = pd.Timestamp(latest_nav["日期"].iloc[-1]).date()
         latest_state = latest_nav.iloc[-1]
         current_holdings = [] if latest_state["持仓"] == "现金" else str(latest_state["持仓"]).split("|")
         current_exposure = float(latest_state["总仓位"])
+        current_nav = float(latest_nav["净值"].iloc[-1])
+        historical_peak = float(latest_nav["净值"].max())
+        current_drawdown = current_nav / historical_peak - 1.0 if historical_peak > 0 else float("nan")
+        peak_index = latest_nav["净值"].idxmax()
+        peak_date = latest_nav.loc[peak_index, "日期"]
+        recent_start = max(
+            EARLIEST_BACKTEST_START,
+            (pd.Timestamp(holding_day) - pd.DateOffset(years=2)).date(),
+        )
+        recent_metrics, _, _, _, _ = backtest(
+            data,
+            scores,
+            start=recent_start,
+            end=holding_day,
+            **latest_settings,
+        )
+        next_execution_day = next_trading_day(data, pd.Timestamp(holding_day))
+        volatility_day = (
+            pd.Timestamp(next_execution_day)
+            if next_execution_day is not None
+            else pd.Timestamp(holding_day) + pd.Timedelta(days=1)
+        )
         position_table = position_management_snapshot(
             data,
             score_day,
@@ -426,8 +502,55 @@ def main() -> None:
             current_holdings,
             current_exposure,
             **latest_settings,
+            volatility_day=volatility_day,
         )
-        st.info(f"信号日期：{score_day.date()} · {latest_mode_label} · {reason} · 最新建议持仓：{', '.join(ASSETS[x] for x in selected_holdings) if selected_holdings else '现金'}")
+        recommended_names = "、".join(ASSETS[x] for x in selected_holdings) if selected_holdings else "现金"
+        recommended_codes = "、".join(selected_holdings) if selected_holdings else "—"
+        st.subheader("最新建议持仓")
+        st.metric("最新建议持仓", recommended_names)
+        st.info(f"信号日期：{score_day.date()} · {latest_mode_label} · {reason} · 标的代码：{recommended_codes}")
+        recommendation_status = str(position_table.iloc[0]["仓位判断"])
+        if recommendation_status in {"需要按信号换仓", "需要增仓", "需要减仓", "转入现金"}:
+            st.warning(f"⚠️ 仓位调整判断：需要调整（{recommendation_status}）")
+        else:
+            st.success(f"✅ 仓位调整判断：暂不需要调整（{recommendation_status}）")
+        st.subheader("当前回撤")
+        st.metric("当前回撤（相对历史峰值）", pct(current_drawdown))
+        st.info(
+            f"截至 {holding_day}，当前组合资产净值为 {current_nav:,.2f}；"
+            f"历史最高资产净值为 {historical_peak:,.2f}，出现在 {peak_date}。"
+            f"当前净值较该历史峰值回落 {abs(current_drawdown):.2%}。"
+        )
+        st.caption(f"当前回撤 =（当前组合资产净值 ÷ 历史最高资产净值）− 1；统计区间为 {analysis_start} 至 {holding_day}。")
+
+        st.subheader("最近两年策略绩效")
+        recent_cards = [
+            ("累计收益", pct(recent_metrics["累计收益"])),
+            ("年化收益", pct(recent_metrics["年化收益"])),
+            ("最大回撤", pct(recent_metrics["最大回撤"])),
+            ("年化波动", pct(recent_metrics["年化波动"])),
+            ("夏普系数", f"{recent_metrics['夏普']:.2f}" if recent_metrics["夏普"] == recent_metrics["夏普"] else "—"),
+            ("交易次数", f"{recent_metrics['交易次数']:,}"),
+        ]
+        recent_cols = st.columns(len(recent_cards))
+        for col, (label, value) in zip(recent_cols, recent_cards):
+            col.metric(label, value)
+        st.caption(f"绩效区间：{recent_start} 至 {holding_day}。若数据不足两年，则从允许的最早日期开始计算。")
+
+        st.subheader("全历史周期策略绩效")
+        full_cards = [
+            ("累计收益", pct(full_metrics["累计收益"])),
+            ("年化收益", pct(full_metrics["年化收益"])),
+            ("最大回撤", pct(full_metrics["最大回撤"])),
+            ("年化波动", pct(full_metrics["年化波动"])),
+            ("夏普系数", f"{full_metrics['夏普']:.2f}" if full_metrics["夏普"] == full_metrics["夏普"] else "—"),
+            ("交易次数", f"{full_metrics['交易次数']:,}"),
+        ]
+        full_cols = st.columns(len(full_cards))
+        for col, (label, value) in zip(full_cols, full_cards):
+            col.metric(label, value)
+        st.caption(f"绩效区间：{analysis_start} 至 {holding_day}。全历史绩效用于观察当前分析区间内的完整风险收益表现。")
+
         st.subheader("仓位管理")
         position_row = position_table.iloc[0]
         metric_values = [
@@ -441,6 +564,42 @@ def main() -> None:
         for col, (label, value) in zip(metric_cols, metric_values):
             col.metric(label, value)
         st.caption(f"目标波动率：{pct(position_row['目标波动率'])} · 仓位调整带：{pct(position_row['仓位调整带'])}。当前策略仓位为按内置数据从 {EARLIEST_BACKTEST_START} 回放至最新信号日的结果，不代表券商账户实时持仓。")
+        st.subheader("仓位调整提示")
+        position_status = str(position_row["仓位判断"])
+        target_exposure = float(position_row["目标总仓位"])
+        current_exposure = float(position_row["当前策略总仓位"])
+        exposure_gap = abs(current_exposure - target_exposure)
+        execution_day = next_execution_day
+        execution_label = str(execution_day) if execution_day is not None else "待数据更新确认"
+        current_names = str(position_row["当前策略持仓名称"])
+        target_names = str(position_row["推荐持仓名称"])
+        if position_status == "需要按信号换仓":
+            action_text = (
+                f"需要进行信号调仓：当前持仓为 {current_names}，建议持仓为 {target_names}。"
+                f"目标总仓位为 {pct(target_exposure)}，请在下一交易日（{execution_label}）开盘执行。"
+            )
+            st.warning(f"⚠️ {action_text}")
+        elif position_status == "需要增仓":
+            action_text = (
+                f"需要增仓：当前总仓位 {pct(current_exposure)}，目标总仓位 {pct(target_exposure)}，"
+                f"应增加约 {pct(target_exposure - current_exposure)}。请在下一交易日（{execution_label}）开盘执行。"
+            )
+            st.warning(f"⚠️ {action_text}")
+        elif position_status == "需要减仓":
+            action_text = (
+                f"需要减仓：当前总仓位 {pct(current_exposure)}，目标总仓位 {pct(target_exposure)}，"
+                f"应减少约 {pct(current_exposure - target_exposure)}。请在下一交易日（{execution_label}）开盘执行。"
+            )
+            st.warning(f"⚠️ {action_text}")
+        elif position_status == "转入现金":
+            action_text = f"需要转入现金：当前没有有效的正分标的。请在下一交易日（{execution_label}）开盘卖出当前持仓。"
+            st.warning(f"⚠️ {action_text}")
+        else:
+            st.success(
+                f"✅ 当前无需进行仓位调整：当前总仓位 {pct(current_exposure)}，目标总仓位 {pct(target_exposure)}，"
+                f"仓位偏离 {pct(exposure_gap)}，未超过调整带 {pct(float(position_row['仓位调整带']))}。"
+            )
+        st.caption("判断顺序：先判断推荐持仓是否变化；若持仓未变，再使用当前收盘后的最近20日波动率判断下一交易日仓位偏离是否超过调整带。信号和仓位调整均在下一交易日开盘执行，页面不会自动下单。")
         position_display = position_table.copy()
         for column in ["组合估计年化波动率", "目标波动率", "目标总仓位", "目标现金比例", "当前策略总仓位", "仓位偏离", "仓位调整带"]:
             position_display[column] = position_display[column].map(pct)
