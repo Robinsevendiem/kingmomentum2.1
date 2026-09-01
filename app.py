@@ -10,7 +10,19 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from kingmomentum_core import ASSETS, coverage_table, latest_signal, load_data, portfolio_volatility, position_management_snapshot, refresh_with_pandadata, score_panel, backtest
+from kingmomentum_core import (
+    ASSETS,
+    coverage_table,
+    fetch_symbol_with_pandadata,
+    latest_signal,
+    load_data,
+    normalize_symbol_input,
+    portfolio_volatility,
+    position_management_snapshot,
+    refresh_with_pandadata,
+    score_panel,
+    backtest,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -28,6 +40,18 @@ def cached_data() -> dict:
 @st.cache_data(show_spinner=False)
 def cached_scores(data: dict) -> object:
     return score_panel(data, window=25)
+
+
+def pandadata_credentials() -> tuple[str, str]:
+    """Read credentials from Streamlit Secrets, with local env fallback."""
+    try:
+        secrets = st.secrets
+        username = secrets.get("PANDA_DATA_USERNAME", "")
+        password = secrets.get("PANDA_DATA_PASSWORD", "")
+    except Exception:
+        username = ""
+        password = ""
+    return str(username or os.getenv("PANDA_DATA_USERNAME", "")), str(password or os.getenv("PANDA_DATA_PASSWORD", ""))
 
 
 def pct(value: float | None) -> str:
@@ -70,14 +94,35 @@ def build_rebalance_summary(rebalances: pd.DataFrame, trades: pd.DataFrame) -> p
 
 
 def resolve_symbol_input(value: str) -> str | None:
-    normalized = value.strip().upper()
-    if not normalized:
-        return None
-    if "." in normalized:
-        return normalized if normalized in ASSETS else None
-    code = normalized.zfill(6)
-    matches = [symbol for symbol in ASSETS if symbol.endswith(f".{code}")]
-    return matches[0] if len(matches) == 1 else None
+    return normalize_symbol_input(value)
+
+
+def add_symbol_to_session(input_code: str, input_name: str, all_data: dict) -> str:
+    """Load a local file or fetch an unbundled symbol into this Streamlit session."""
+    symbol = resolve_symbol_input(input_code)
+    if symbol is None:
+        raise ValueError("无法识别代码，请输入6位代码，或使用 SHSE.518880 / SZSE.159915 格式")
+    if symbol in all_data:
+        return symbol
+
+    local_path = DATA_DIR / f"{symbol}.parquet"
+    if local_path.exists():
+        frame = load_data(DATA_DIR, symbols=[symbol])[symbol]
+    else:
+        username, password = pandadata_credentials()
+        if not username or not password:
+            raise RuntimeError(
+                "该标的不在仓库内置快照中。请先在 Streamlit Settings → Secrets 配置 "
+                "PANDA_DATA_USERNAME 和 PANDA_DATA_PASSWORD，再重新加入。"
+            )
+        with st.spinner(f"正在从 PandaData 获取 {symbol} 的历史日线数据…"):
+            frame = fetch_symbol_with_pandadata(symbol, username, password, EARLIEST_BACKTEST_START, date.today())
+
+    name = input_name.strip() or f"新增标的 {symbol.split('.')[1]}"
+    st.session_state.setdefault("dynamic_data", {})[symbol] = frame
+    st.session_state.setdefault("symbol_names", {})[symbol] = name
+    ASSETS[symbol] = name
+    return symbol
 
 
 def parse_date_text(value: str) -> date | None:
@@ -255,35 +300,50 @@ def main() -> None:
     st.title("KingMomentum ETF / LOF 轮动策略")
     st.caption("25个交易日对数价格加权线性回归 · 收盘计算信号 · 下一交易日开盘执行")
     try:
-        all_data = cached_data()
+        bundled_data = cached_data()
     except Exception as exc:
         st.error(f"数据读取失败：{exc}")
         st.stop()
+
+    # 新增标的数据只保存在当前 Streamlit 会话，避免向云端仓库写文件。
+    dynamic_data = st.session_state.get("dynamic_data", {})
+    symbol_names = st.session_state.get("symbol_names", {})
+    for symbol, name in symbol_names.items():
+        ASSETS[symbol] = name
+    all_data = {**bundled_data, **dynamic_data}
+    for symbol in dynamic_data:
+        ASSETS.setdefault(symbol, symbol_names.get(symbol, f"新增标的 {symbol.split('.')[-1]}"))
 
     with st.sidebar:
         st.header("策略与数据")
         page = st.radio("页面", ["回测", "最新持仓", "策略说明"], index=0)
         if "selected_symbols" not in st.session_state:
-            st.session_state.selected_symbols = list(ASSETS)
+            st.session_state.selected_symbols = list(bundled_data)
+        st.session_state.selected_symbols = [symbol for symbol in st.session_state.selected_symbols if symbol in all_data]
         selected = st.multiselect(
             "标的池（代码 · 名称）",
-            list(ASSETS),
+            list(all_data),
             default=st.session_state.selected_symbols,
-            format_func=lambda x: f"{x} · {ASSETS[x]}",
+            format_func=lambda x: f"{x} · {ASSETS.get(x, x)}",
         )
         st.session_state.selected_symbols = selected
         with st.form("add_symbol_form", clear_on_submit=True):
             input_code = st.text_input("输入代码加入标的池", placeholder="例如 518880")
+            input_name = st.text_input("中文名称（可选）", placeholder="例如 中证500ETF")
             add_symbol = st.form_submit_button("加入标的池")
         if add_symbol:
-            symbol = resolve_symbol_input(input_code)
-            if symbol is None:
-                st.error("该代码不在当前9个标的数据快照中，请先补充对应数据文件。")
-            elif symbol not in st.session_state.selected_symbols:
-                st.session_state.selected_symbols.append(symbol)
-                st.rerun()
+            try:
+                symbol = add_symbol_to_session(input_code, input_name, all_data)
+            except Exception as exc:
+                st.error(f"加入失败：{exc}")
             else:
-                st.info("该标的已经在当前标的池中。")
+                if symbol not in st.session_state.selected_symbols:
+                    st.session_state.selected_symbols.append(symbol)
+                    st.success(f"已加入 {symbol}。数据仅保存在当前会话中。")
+                    st.rerun()
+                else:
+                    st.info("该标的已经在当前标的池中。")
+        st.caption("内置9个标的可直接使用；新增代码将通过 PandaData 获取历史数据，并仅在当前会话保留。")
         selected = st.session_state.selected_symbols
         if not selected:
             st.warning("请至少选择一个标的")
@@ -455,10 +515,16 @@ def main() -> None:
         c1, c2 = st.columns([1, 3])
         with c1:
             if st.button("更新数据", type="primary"):
-                username = st.secrets.get("PANDA_DATA_USERNAME", os.getenv("PANDA_DATA_USERNAME", ""))
-                password = st.secrets.get("PANDA_DATA_PASSWORD", os.getenv("PANDA_DATA_PASSWORD", ""))
+                username, password = pandadata_credentials()
                 try:
-                    count, updated_to = refresh_with_pandadata(DATA_DIR, username, password, EARLIEST_BACKTEST_START, date.today())
+                    count, updated_to = refresh_with_pandadata(
+                        DATA_DIR,
+                        username,
+                        password,
+                        EARLIEST_BACKTEST_START,
+                        date.today(),
+                        symbols=tuple(bundled_data),
+                    )
                     st.success(f"已更新 {count} 个标的，目标日期：{updated_to}")
                     cached_data.clear()
                     cached_scores.clear()

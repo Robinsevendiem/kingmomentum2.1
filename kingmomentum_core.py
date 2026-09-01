@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date
 import tempfile
 from pathlib import Path
@@ -21,21 +22,69 @@ ASSETS = {
     "SZSE.159915": "创业板",
     "SHSE.501018": "南方原油LOF",
 }
+DEFAULT_SYMBOLS = tuple(ASSETS)
+REQUIRED_MARKET_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
-def load_data(data_dir: Path) -> dict[str, pd.DataFrame]:
+def normalize_symbol_input(value: str) -> str | None:
+    """Normalize common A-share exchange/code formats to ``SHSE.123456``."""
+    text = str(value or "").strip().upper().replace("-", ".")
+    if not text:
+        return None
+    parts = [part for part in text.split(".") if part]
+    exchange: str | None = None
+    code: str | None = None
+    if len(parts) == 1 and parts[0].isdigit():
+        code = parts[0].zfill(6)
+    elif len(parts) == 2:
+        left, right = parts
+        exchange_aliases = {"SH": "SHSE", "SHSE": "SHSE", "SSE": "SHSE", "SZ": "SZSE", "SZSE": "SZSE"}
+        if left in exchange_aliases and right.isdigit():
+            exchange, code = exchange_aliases[left], right.zfill(6)
+        elif right in exchange_aliases and left.isdigit():
+            exchange, code = exchange_aliases[right], left.zfill(6)
+    if code is None or len(code) != 6:
+        return None
+    if exchange is None:
+        # ETF/LOF codes in the project's universe are unambiguous under this
+        # convention: 5/6/9-series are Shanghai, 0/1/2/3-series Shenzhen.
+        if code.startswith(("0", "1", "2", "3")):
+            exchange = "SZSE"
+        elif code.startswith(("5", "6", "9")):
+            exchange = "SHSE"
+        else:
+            return None
+    return f"{exchange}.{code}"
+
+
+def _normalize_market_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Normalize a local/API daily frame to the app's OHLCV contract."""
+    if frame is None or frame.empty:
+        raise ValueError(f"{symbol}没有可用日线数据")
+    normalized = frame.copy()
+    date_column = next((column for column in ("date", "eob", "trade_date") if column in normalized.columns), None)
+    if date_column is not None:
+        normalized.index = pd.DatetimeIndex(pd.to_datetime(normalized.pop(date_column))).tz_localize(None)
+    else:
+        normalized.index = pd.DatetimeIndex(pd.to_datetime(normalized.index)).tz_localize(None)
+    normalized = normalized[~normalized.index.duplicated(keep="last")].sort_index()
+    missing = set(REQUIRED_MARKET_COLUMNS) - set(normalized.columns)
+    if missing:
+        raise ValueError(f"{symbol}缺少字段：{sorted(missing)}")
+    normalized = normalized.loc[:, list(REQUIRED_MARKET_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+    if normalized.empty or (normalized["close"] <= 0).all():
+        raise ValueError(f"{symbol}没有有效收盘价")
+    return normalized
+
+
+def load_data(data_dir: Path, symbols: Sequence[str] | None = None) -> dict[str, pd.DataFrame]:
     data: dict[str, pd.DataFrame] = {}
-    for symbol in ASSETS:
+    requested = tuple(DEFAULT_SYMBOLS if symbols is None else symbols)
+    for symbol in requested:
         path = data_dir / f"{symbol}.parquet"
         if not path.exists():
             raise FileNotFoundError(path)
-        frame = pd.read_parquet(path).copy()
-        frame.index = pd.to_datetime(frame.index).tz_localize(None)
-        frame = frame.sort_index()
-        required = {"open", "high", "low", "close", "volume"}
-        if not required.issubset(frame.columns):
-            raise ValueError(f"{symbol}缺少字段：{sorted(required - set(frame.columns))}")
-        data[symbol] = frame
+        data[symbol] = _normalize_market_frame(pd.read_parquet(path), symbol)
     return data
 
 
@@ -181,6 +230,121 @@ def position_management_snapshot(
     )
 
 
+TREND_FILTER_LABELS = {
+    "price_above_sma60": "价格高于60日均线",
+    "sma60_up": "价格高于60日均线且均线向上",
+    "multi_horizon_vote": "20/60/120日收益多数为正",
+}
+
+
+def single_asset_trend_symbols(
+    data: dict[str, pd.DataFrame], day: pd.Timestamp, method: str
+) -> set[str]:
+    """Return symbols passing a candidate-level, close-only trend filter."""
+    if method not in TREND_FILTER_LABELS:
+        raise ValueError(f"未知单标的趋势过滤器：{method}")
+    passed: set[str] = set()
+    for symbol, frame in data.items():
+        close = frame["close"].astype(float).loc[lambda series: series.index <= day]
+        if close.empty:
+            continue
+        latest = float(close.iloc[-1])
+        sma60 = close.rolling(60, min_periods=60).mean()
+        if method == "price_above_sma60":
+            if len(close) >= 60 and np.isfinite(sma60.iloc[-1]) and latest > float(sma60.iloc[-1]):
+                passed.add(symbol)
+        elif method == "sma60_up":
+            if len(close) < 80:
+                continue
+            current_sma = sma60.iloc[-1]
+            prior_sma = sma60.iloc[-21]
+            if np.isfinite(current_sma) and np.isfinite(prior_sma) and latest > current_sma and current_sma > prior_sma:
+                passed.add(symbol)
+        elif method == "multi_horizon_vote":
+            if len(close) < 121:
+                continue
+            returns = [latest / float(close.iloc[-lookback - 1]) - 1.0 for lookback in (20, 60, 120)]
+            if sum(value > 0 for value in returns) >= 2:
+                passed.add(symbol)
+    return passed
+
+
+def single_asset_trend_scale(
+    data: dict[str, pd.DataFrame],
+    symbols: list[str],
+    day: pd.Timestamp,
+    method: str,
+    weak_multiplier: float,
+) -> float:
+    """Return a soft exposure multiplier using information before ``day``.
+
+    The multiplier is evaluated for the currently intended holdings before
+    the execution-day open. For the current Top-1 strategy, ``symbols`` has
+    one member. Multiple holdings use the mean of their individual factors.
+    """
+    if not symbols:
+        return 0.0
+    if not 0.0 <= weak_multiplier <= 1.0:
+        raise ValueError("趋势弱势仓位系数必须位于0到1之间")
+    factors: list[float] = []
+    for symbol in symbols:
+        frame = data[symbol]
+        close = frame["close"].astype(float).loc[lambda series: series.index < day]
+        if close.empty:
+            factors.append(weak_multiplier)
+            continue
+        latest = float(close.iloc[-1])
+        if method == "price_above_sma60":
+            sma60 = close.rolling(60, min_periods=60).mean().iloc[-1]
+            passed = len(close) >= 60 and np.isfinite(sma60) and latest > float(sma60)
+        elif method == "sma60_up":
+            if len(close) < 80:
+                passed = False
+            else:
+                sma60 = close.rolling(60, min_periods=60).mean()
+                current_sma = sma60.iloc[-1]
+                prior_sma = sma60.iloc[-21]
+                passed = np.isfinite(current_sma) and np.isfinite(prior_sma) and latest > float(current_sma) and current_sma > float(prior_sma)
+        elif method == "multi_horizon_vote":
+            if len(close) < 121:
+                passed = False
+            else:
+                returns = [latest / float(close.iloc[-lookback - 1]) - 1.0 for lookback in (20, 60, 120)]
+                passed = sum(value > 0 for value in returns) >= 2
+        else:
+            raise ValueError(f"未知趋势缩放器：{method}")
+        factors.append(1.0 if passed else weak_multiplier)
+    return float(np.mean(factors))
+
+
+def _annualized_covariance(returns: pd.DataFrame, method: str, ewma_half_life: int) -> pd.DataFrame:
+    """Estimate an annualized covariance matrix for position sizing."""
+    if method == "rolling":
+        return returns.cov() * 252.0
+    if method == "downside":
+        clean = returns.dropna(how="any")
+        if clean.empty:
+            return clean.cov()
+        downside = np.minimum(clean.to_numpy(dtype=float), 0.0)
+        covariance = downside.T @ downside / len(clean)
+        return pd.DataFrame(covariance * 252.0, index=clean.columns, columns=clean.columns)
+    if method != "ewma":
+        raise ValueError(f"未知波动率估计方法：{method}")
+    if ewma_half_life < 1:
+        raise ValueError("EWMA半衰期必须为正整数")
+    clean = returns.dropna(how="any")
+    if clean.empty:
+        return clean.cov()
+    decay = 0.5 ** (1.0 / ewma_half_life)
+    weights = decay ** np.arange(len(clean) - 1, -1, -1, dtype=float)
+    weights /= weights.sum()
+    values = clean.to_numpy(dtype=float)
+    mean = np.sum(values * weights[:, None], axis=0)
+    centered = values - mean[None, :]
+    covariance = (centered * weights[:, None]).T @ centered
+    return pd.DataFrame(covariance * 252.0, index=clean.columns, columns=clean.columns)
+
+
 def _select_targets(
     scores: pd.DataFrame,
     day: pd.Timestamp,
@@ -189,13 +353,18 @@ def _select_targets(
     top_n: int,
     buffer: float,
     cutoff: float,
+    allowed_symbols: set[str] | None = None,
 ) -> tuple[list[str], str, dict[str, float]]:
     today = scores.loc[day].dropna() if day in scores.index else pd.Series(dtype=float)
     positive = today[today > 0]
     if positive.empty:
         return [], "所有标的分数≤0，持有现金", {}
     valid = positive[positive <= cutoff]
+    if allowed_symbols is not None:
+        valid = valid[valid.index.isin(allowed_symbols)]
     if valid.empty:
+        if allowed_symbols is not None:
+            return [], "没有通过单标的趋势确认的有效候选，持有现金", {}
         return current, "所有正分标的过热，保留当前持仓", {}
     ranked = list(valid.sort_values(ascending=False).index)
     n = min(top_n, len(ranked))
@@ -262,8 +431,41 @@ def backtest(
     fee: float = 0.0005,
     target_volatility: float | None = 0.15,
     rebalance_band: float = 0.10,
+    volatility_lookback: int = 20,
+    volatility_method: str = "rolling",
+    ewma_half_life: int = 10,
+    volatility_shock_enabled: bool = False,
+    shock_short_window: int = 5,
+    shock_long_window: int = 40,
+    shock_trigger_ratio: float = 1.50,
+    shock_recovery_ratio: float = 1.20,
+    shock_recovery_days: int = 3,
+    shock_multiplier: float = 0.50,
+    trend_filter: str | None = None,
+    trend_scaling_method: str | None = None,
+    trend_weak_multiplier: float = 0.50,
+    max_target_exposure: float | None = None,
+    min_target_exposure: float = 0.0,
+    max_exposure_increase: float | None = None,
+    recovery_uses_raw_target_for_band: bool = False,
     initial: float = 100_000.0,
 ) -> tuple[dict[str, float | str], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if volatility_lookback < 2:
+        raise ValueError("波动率回看窗口至少需要2个交易日")
+    if shock_short_window < 2 or shock_long_window <= shock_short_window:
+        raise ValueError("波动率突增窗口必须满足长期窗口大于短期窗口，且短期窗口至少为2日")
+    if shock_trigger_ratio <= 0 or shock_recovery_ratio <= 0 or shock_recovery_ratio >= shock_trigger_ratio:
+        raise ValueError("波动率突增的恢复阈值必须小于触发阈值且均为正数")
+    if shock_recovery_days < 1 or not 0.0 <= shock_multiplier <= 1.0:
+        raise ValueError("波动率突增恢复天数必须为正数，降仓系数必须位于0到1之间")
+    if max_target_exposure is not None and not 0.0 <= max_target_exposure <= 1.0:
+        raise ValueError("仓位上限必须位于0到1之间")
+    if not 0.0 <= min_target_exposure <= 1.0:
+        raise ValueError("仓位下限必须位于0到1之间")
+    if max_target_exposure is not None and min_target_exposure > max_target_exposure:
+        raise ValueError("仓位下限不能高于仓位上限")
+    if max_exposure_increase is not None and not 0.0 < max_exposure_increase <= 1.0:
+        raise ValueError("每日最大增仓比例必须大于0且不超过1")
     dates = pd.DatetimeIndex(sorted(set().union(*[set(frame.index) for frame in data.values()])))
     dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
     cash = initial
@@ -277,6 +479,8 @@ def backtest(
     pending_reason = "建立新仓位"
     pending_scores: dict[str, float] = {}
     last_rebalance_nav: float | None = None
+    shock_active = False
+    shock_recovery_count = 0
 
     for day in dates:
         open_values = {x: holdings[x] * (_price(data, x, day, "open") or 0.0) for x in holdings}
@@ -288,13 +492,53 @@ def backtest(
         target_weights = pd.Series(1.0 / len(pending), index=pending, dtype=float) if pending else pd.Series(dtype=float)
         if pending and target_volatility is not None:
             returns = pd.concat([data[x]["close"].pct_change().rename(x) for x in pending], axis=1)
-            returns = returns.loc[returns.index < day].tail(20)
-            covariance = returns.cov() * 252.0
+            returns = returns.loc[returns.index < day].tail(volatility_lookback)
+            covariance = _annualized_covariance(returns, volatility_method, ewma_half_life)
             weight_array = target_weights.reindex(covariance.index).fillna(0).to_numpy()
             variance = float(weight_array @ covariance.fillna(0).to_numpy() @ weight_array)
             current_vol = np.sqrt(max(variance, 0.0))
             if np.isfinite(current_vol) and current_vol > 0:
                 target_exposure = min(1.0, target_volatility / current_vol)
+        if pending and volatility_shock_enabled:
+            short_vol = portfolio_volatility(data, pending, day, lookback=shock_short_window)
+            long_vol = portfolio_volatility(data, pending, day, lookback=shock_long_window)
+            shock_ratio = short_vol / long_vol if np.isfinite(short_vol) and np.isfinite(long_vol) and long_vol > 0 else np.nan
+            if np.isfinite(shock_ratio):
+                if shock_active:
+                    if shock_ratio <= shock_recovery_ratio:
+                        shock_recovery_count += 1
+                        if shock_recovery_count >= shock_recovery_days:
+                            shock_active = False
+                            shock_recovery_count = 0
+                    else:
+                        shock_recovery_count = 0
+                elif shock_ratio >= shock_trigger_ratio:
+                    shock_active = True
+                    shock_recovery_count = 0
+            if shock_active:
+                target_exposure *= shock_multiplier
+        if pending and trend_scaling_method:
+            target_exposure *= single_asset_trend_scale(
+                data,
+                pending,
+                day,
+                trend_scaling_method,
+                trend_weak_multiplier,
+            )
+        raw_target_exposure_for_recovery = target_exposure
+        if pending and target_exposure > 0:
+            if max_target_exposure is not None:
+                target_exposure = min(target_exposure, max_target_exposure)
+            target_exposure = max(target_exposure, min_target_exposure)
+        # 只限制同一持仓下的恢复速度；风险上升时仍允许立即减仓。
+        if (
+            pending
+            and holdings
+            and set(pending) == set(holdings)
+            and max_exposure_increase is not None
+            and target_exposure > pre_exposure
+        ):
+            target_exposure = min(target_exposure, pre_exposure + max_exposure_increase)
         target_weights *= target_exposure
         desired_values = nav_open * target_weights
         if pending and holdings and set(pending) == set(holdings) and rebalance_band > 0:
@@ -302,7 +546,13 @@ def backtest(
             union = current_weights.index.union(target_weights.index)
             gap = (current_weights.reindex(union).fillna(0) - target_weights.reindex(union).fillna(0)).abs().max()
             cash_gap = abs(cash / nav_open - (1.0 - target_weights.sum())) if nav_open else 0.0
-            if max(float(gap), float(cash_gap)) <= rebalance_band:
+            recovery_triggered = (
+                recovery_uses_raw_target_for_band
+                and max_exposure_increase is not None
+                and raw_target_exposure_for_recovery > pre_exposure
+                and raw_target_exposure_for_recovery - pre_exposure > rebalance_band
+            )
+            if max(float(gap), float(cash_gap)) <= rebalance_band and not recovery_triggered:
                 desired_values = pd.Series(open_values).reindex(pending).fillna(0.0)
 
         def sell(symbol: str, shares: float, reason: str, trade_day: pd.Timestamp = day) -> None:
@@ -400,7 +650,16 @@ def backtest(
 
         signal_day = scores.index[scores.index <= day][-1] if len(scores.index[scores.index <= day]) else None
         if signal_day is not None:
-            selected, reason, score_values = _select_targets(scores, signal_day, list(holdings), top_n=top_n, buffer=buffer, cutoff=cutoff)
+            allowed_symbols = single_asset_trend_symbols(data, signal_day, trend_filter) if trend_filter else None
+            selected, reason, score_values = _select_targets(
+                scores,
+                signal_day,
+                list(holdings),
+                top_n=top_n,
+                buffer=buffer,
+                cutoff=cutoff,
+                allowed_symbols=allowed_symbols,
+            )
             if selected != pending:
                 pending_signal_day = signal_day.date()
                 pending_reason = reason
@@ -457,50 +716,58 @@ def _prepare_pandadata_runtime() -> None:
     auth_manager._user_json_dir = str(runtime_dir)
 
 
-def refresh_with_pandadata(data_dir: Path, username: str, password: str, start: date, end: date) -> tuple[int, str]:
-    """Optional updater; requires PandaData credentials and SDK in deployment secrets."""
+def fetch_symbol_with_pandadata(symbol: str, username: str, password: str, start: date, end: date) -> pd.DataFrame:
+    """Fetch one additional fund/ETF symbol for the current Streamlit session."""
     try:
         import panda_data
     except ImportError as exc:
         raise RuntimeError("未安装 panda_data，请在 requirements.txt 中安装后重试") from exc
     if not username or not password:
         raise RuntimeError("请先配置 PANDA_DATA_USERNAME 和 PANDA_DATA_PASSWORD")
+    normalized_symbol = normalize_symbol_input(symbol)
+    if normalized_symbol is None:
+        raise ValueError("无法识别代码，请输入6位代码，或使用 SHSE.518880 / SZSE.159915 格式")
     _prepare_pandadata_runtime()
     panda_data.init_token(username=username, password=password)
+    prefix, code = normalized_symbol.split(".")
+    native = f"{code}.{'SH' if prefix == 'SHSE' else 'SZ'}"
+    frames: list[pd.DataFrame] = []
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(chunk_start + pd.Timedelta(days=364).to_pytimedelta(), end)
+        frame = panda_data.get_fund_daily_pre(
+            start_date=chunk_start.strftime("%Y%m%d"),
+            end_date=chunk_end.strftime("%Y%m%d"),
+            symbol=native,
+            fields=[],
+        )
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+        chunk_start = chunk_end + pd.Timedelta(days=1).to_pytimedelta()
+    if not frames:
+        raise RuntimeError(f"PandaData 未返回 {normalized_symbol} 的日线数据，请检查代码、权限或上市日期")
+    return _normalize_market_frame(pd.concat(frames, axis=0), normalized_symbol)
+
+
+def refresh_with_pandadata(
+    data_dir: Path,
+    username: str,
+    password: str,
+    start: date,
+    end: date,
+    symbols: Sequence[str] | None = None,
+) -> tuple[int, str]:
+    """Update the built-in snapshot, optionally restricted to given symbols."""
+    requested = tuple(DEFAULT_SYMBOLS if symbols is None else symbols)
     updated = 0
-    for symbol in ASSETS:
-        prefix, code = symbol.split(".")
-        exchange = "SH" if prefix == "SHSE" else "SZ"
-        native = f"{code}.{exchange}"
+    for symbol in requested:
         existing_path = data_dir / f"{symbol}.parquet"
-        if existing_path.exists():
-            existing = pd.read_parquet(existing_path)
-            existing.index = pd.to_datetime(existing.index).tz_localize(None)
-            fetch_start = existing.index.max().date() + pd.Timedelta(days=1).to_pytimedelta()
-        else:
-            existing = pd.DataFrame()
-            fetch_start = start
+        existing = load_data(data_dir, symbols=[symbol])[symbol] if existing_path.exists() else pd.DataFrame()
+        fetch_start = existing.index.max().date() + pd.Timedelta(days=1).to_pytimedelta() if not existing.empty else start
         if fetch_start > end:
             continue
-        frames = []
-        chunk_start = fetch_start
-        while chunk_start <= end:
-            chunk_end = min(chunk_start + pd.Timedelta(days=364).to_pytimedelta(), end)
-            frame = panda_data.get_fund_daily_pre(start_date=chunk_start.strftime("%Y%m%d"), end_date=chunk_end.strftime("%Y%m%d"), symbol=native, fields=[])
-            if frame is not None and not frame.empty:
-                frame = frame.copy()
-                date_column = "date" if "date" in frame.columns else "eob"
-                frame[date_column] = pd.to_datetime(frame[date_column])
-                frames.append(frame.set_index(date_column))
-            chunk_start = chunk_end + pd.Timedelta(days=1).to_pytimedelta()
-        if not frames:
-            continue
-        frame = pd.concat([existing, *frames], axis=0)
-        frame.index = pd.to_datetime(frame.index).tz_localize(None)
-        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
-        columns = [x for x in ["open", "high", "low", "close", "volume"] if x in frame.columns]
-        if len(columns) < 5:
-            continue
-        frame[columns].to_parquet(existing_path)
+        frame = fetch_symbol_with_pandadata(symbol, username, password, fetch_start, end)
+        combined = pd.concat([existing, frame], axis=0) if not existing.empty else frame
+        _normalize_market_frame(combined, symbol).to_parquet(existing_path)
         updated += 1
     return updated, end.isoformat()

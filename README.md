@@ -10,6 +10,7 @@
 - **记录**：信号调仓、风险仓位再平衡、每日净值和每日持仓，支持CSV下载；
 - **周期收益**：月度热力图、季度收益和年度收益；红色代表盈利，绿色代表亏损；
 - **最新持仓**：计算最新动量分数、推荐标的、目标总仓位、当前策略仓位和仓位调整判断；
+- **动态加入标的**：侧边栏输入6位代码即可加入标的池；内置快照之外的标的通过 PandaData 获取历史日线，并在当前会话内参与回测；
 - **策略说明**：解释25日加权回归、动量分数、过热阈值、换仓缓冲、目标波动率和调仓记录公式，并提供实际数据案例。
 
 ## 项目结构
@@ -82,7 +83,7 @@ macOS 也可以双击 `open_kingmomentum_app.command`。脚本会检查依赖、
 3. 使用 `requirements.txt` 安装依赖；
 4. 部署后检查“回测”“最新持仓”和“策略说明”三个页面。
 
-基础应用使用仓库内置数据快照；“最新持仓 → 更新数据”会使用 `panda_data` SDK 从 PandaData 拉取增量数据，并在 Streamlit 的 `Settings → Secrets` 中读取以下配置：
+基础应用使用仓库内置数据快照；“最新持仓 → 更新数据”会使用 `panda_data` SDK 从 PandaData 拉取增量数据。侧边栏加入内置快照之外的代码时，也会使用同一组凭据获取该标的从允许起始日开始的历史数据。Streamlit 的 `Settings → Secrets` 中配置：
 
 ```toml
 PANDA_DATA_USERNAME = "你的PandaData账号"
@@ -96,6 +97,10 @@ PANDA_DATA_PASSWORD = "你的PandaData密码"
 ```
 
 `requirements.txt` 已包含 `panda_data>=0.0.12`，并将 NumPy 限制在 `<2.0` 以满足 SDK 依赖。如果部署环境安装依赖失败，网页仍可使用内置数据快照，但“更新数据”功能不可用；应先检查 Streamlit 的构建日志。
+
+PandaData SDK 登录时会保存加密认证状态。应用已将该缓存重定向到 Streamlit Cloud 的临时目录，以适配云端虚拟环境目录只读的限制；账号密码仍只从 Secrets 读取，不会写入仓库。
+
+动态加入的标的数据保存在 Streamlit 当前会话的 `session_state` 中。应用重启、休眠或重新部署后，需再次加入；如需永久内置，应在本地生成并校验对应的 `data/SHSE.代码.parquet` 或 `data/SZSE.代码.parquet`，再提交到仓库。
 
 ## 策略和数据边界
 
