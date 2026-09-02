@@ -12,6 +12,7 @@ import streamlit as st
 
 from kingmomentum_core import (
     ASSETS,
+    EXECUTION_PRICE_MODES,
     coverage_table,
     fetch_symbol_with_pandadata,
     latest_signal,
@@ -30,6 +31,10 @@ DATA_DIR = APP_DIR / "data"
 EARLIEST_BACKTEST_START = date(2017, 8, 1)
 POSITION_MODES = ["均衡仓位（目标波动率20%）", "防守仓位（目标波动率15%）", "原始满仓/现金"]
 POSITION_MODE_OPTIONS = [*POSITION_MODES, "自定义"]
+EXECUTION_PRICE_OPTIONS = {
+    "下一交易日开盘价（当前基准）": "open",
+    "下一交易日OHLC典型价（敏感性分析）": "typical",
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -181,6 +186,36 @@ def position_mode_controls(container, label: str, key_prefix: str) -> tuple[str,
     return mode, settings, label
 
 
+def execution_price_controls(container, key_prefix: str) -> tuple[dict[str, object], str, str]:
+    """Collect the daily execution-price reference."""
+    price_label = container.selectbox(
+        "调仓成交价格模型",
+        list(EXECUTION_PRICE_OPTIONS),
+        index=0,
+        key=f"{key_prefix}_price_mode",
+    )
+    price_mode = EXECUTION_PRICE_OPTIONS[price_label]
+    if price_mode == "typical":
+        container.caption("典型价=(开盘价+最高价+最低价+收盘价)÷4，仅用于敏感性分析，不等同于真实VWAP。")
+    settings = {"execution_price_mode": price_mode}
+    label = price_label
+    timing = {
+        "open": "下一交易日开盘",
+        "typical": "下一交易日OHLC典型价时点",
+    }[price_mode]
+    return settings, label, timing
+
+
+def execution_caption(settings: dict[str, object]) -> str:
+    mode = str(settings.get("execution_price_mode", "open"))
+    price_label = EXECUTION_PRICE_MODES.get(mode, mode)
+    timing = {
+        "open": "下一交易日开盘",
+        "typical": "下一交易日OHLC典型价时点",
+    }.get(mode, "下一交易日执行")
+    return f"{timing}（基准：{price_label}）"
+
+
 def run_strategy(data: dict, start: date, end: date, mode: str, settings: dict[str, float | None] | None = None):
     settings = mode_settings(mode) if settings is None else settings
     return backtest(data, cached_scores(data), start=start, end=end, **settings)
@@ -298,7 +333,7 @@ def cycle_return_section(nav: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="KingMomentum ETF轮动", page_icon="📈", layout="wide")
     st.title("KingMomentum ETF / LOF 轮动策略")
-    st.caption("25个交易日对数价格加权线性回归 · 收盘计算信号 · 下一交易日开盘执行")
+    st.caption("25个交易日对数价格加权线性回归 · 收盘计算信号 · 可选择下一交易日的成交价格模型")
     try:
         bundled_data = cached_data()
     except Exception as exc:
@@ -356,13 +391,15 @@ def main() -> None:
         st.divider()
         st.markdown("**研究参数**")
         st.markdown("回归窗口：25日  ·  过热阈值：500  ·  换仓缓冲：5  ·  单边成本：0.05%（万分之5）")
-        st.markdown("仓位默认：Top-1、目标波动率20%、10%仓位调整带")
+        st.markdown("仓位默认：Top-1、目标波动率20%、10%仓位调整带；成交默认：下一交易日开盘价、无滑点")
 
     scores = cached_scores(data)
     if page == "回测":
         with st.sidebar:
             with st.form("backtest_form"):
                 mode, settings, mode_label = position_mode_controls(st, "仓位模式", "backtest_position")
+                price_settings, price_label, _ = execution_price_controls(st, "backtest_execution")
+                settings.update(price_settings)
                 quick_range = st.radio("快捷日期", ["自定义", "最近1年", "最近2年", "最近3年", "最近5年"], index=2)
                 years = {"最近1年": 1, "最近2年": 2, "最近3年": 3, "最近5年": 5}
                 quick_start = max(EARLIEST_BACKTEST_START, (pd.Timestamp(common_end) - pd.DateOffset(years=years[quick_range])).date()) if quick_range != "自定义" else EARLIEST_BACKTEST_START
@@ -408,6 +445,7 @@ def main() -> None:
                         "mode": mode,
                         "settings": settings,
                         "mode_label": mode_label,
+                        "price_label": price_label,
                         "date_mode": quick_range,
                         "data_signature": data_signature,
                     }
@@ -428,11 +466,11 @@ def main() -> None:
         cols = st.columns(len(cards))
         for col, (label, value) in zip(cols, cards):
             col.metric(label, value)
-        st.caption(f"回测区间：{start} 至 {end}。数据来自调整后日线快照；策略在首个信号日后于下一交易日开盘执行。")
+        st.caption(f"回测区间：{start} 至 {end}。数据来自调整后日线快照；策略在首个信号日后按{execution_caption(settings)}。")
         st.plotly_chart(nav_chart(nav), use_container_width=True)
         st.plotly_chart(drawdown_chart(nav), use_container_width=True)
         st.subheader("调仓记录")
-        st.caption("调仓前组合收益率：上次实际调仓后收盘至本次调仓前开盘的组合收益率；调仓净值影响：本次成交前后按成交价计算的净值变化，主要反映手续费。成交价格为执行日开盘价。")
+        st.caption(f"调仓前组合收益率：从上一次实际调仓完成后的执行价净值，到本次调仓前按当前执行价重估的组合收益率；调仓净值影响：本次成交前后按成交价计算的净值变化，主要反映手续费。当前成交口径为{execution_caption(settings)}。")
         rebalance_view = build_rebalance_summary(rebalances, trades)
         rebalance_view = rebalance_view.rename(columns={"上次调仓至本次调仓前收益率": "本次调仓前组合收益率", "原因": "调仓原因"})
         display_columns = [
@@ -567,7 +605,8 @@ def main() -> None:
             selected_holdings,
             current_holdings,
             current_exposure,
-            **latest_settings,
+            target_volatility=latest_settings["target_volatility"],
+            rebalance_band=latest_settings["rebalance_band"],
             volatility_day=volatility_day,
         )
         recommended_names = "、".join(ASSETS[x] for x in selected_holdings) if selected_holdings else "现金"
@@ -642,30 +681,30 @@ def main() -> None:
         if position_status == "需要按信号换仓":
             action_text = (
                 f"需要进行信号调仓：当前持仓为 {current_names}，建议持仓为 {target_names}。"
-                f"目标总仓位为 {pct(target_exposure)}，请在下一交易日（{execution_label}）开盘执行。"
+                f"目标总仓位为 {pct(target_exposure)}，请在执行日（{execution_label}）按{execution_caption(latest_settings)}完成。"
             )
             st.warning(f"⚠️ {action_text}")
         elif position_status == "需要增仓":
             action_text = (
                 f"需要增仓：当前总仓位 {pct(current_exposure)}，目标总仓位 {pct(target_exposure)}，"
-                f"应增加约 {pct(target_exposure - current_exposure)}。请在下一交易日（{execution_label}）开盘执行。"
+                f"应增加约 {pct(target_exposure - current_exposure)}。请在执行日（{execution_label}）按{execution_caption(latest_settings)}完成。"
             )
             st.warning(f"⚠️ {action_text}")
         elif position_status == "需要减仓":
             action_text = (
                 f"需要减仓：当前总仓位 {pct(current_exposure)}，目标总仓位 {pct(target_exposure)}，"
-                f"应减少约 {pct(current_exposure - target_exposure)}。请在下一交易日（{execution_label}）开盘执行。"
+                f"应减少约 {pct(current_exposure - target_exposure)}。请在执行日（{execution_label}）按{execution_caption(latest_settings)}完成。"
             )
             st.warning(f"⚠️ {action_text}")
         elif position_status == "转入现金":
-            action_text = f"需要转入现金：当前没有有效的正分标的。请在下一交易日（{execution_label}）开盘卖出当前持仓。"
+            action_text = f"需要转入现金：当前没有有效的正分标的。请在执行日（{execution_label}）按{execution_caption(latest_settings)}卖出当前持仓。"
             st.warning(f"⚠️ {action_text}")
         else:
             st.success(
                 f"✅ 当前无需进行仓位调整：当前总仓位 {pct(current_exposure)}，目标总仓位 {pct(target_exposure)}，"
                 f"仓位偏离 {pct(exposure_gap)}，未超过调整带 {pct(float(position_row['仓位调整带']))}。"
             )
-        st.caption("判断顺序：先判断推荐持仓是否变化；若持仓未变，再使用当前收盘后的最近20日波动率判断下一交易日仓位偏离是否超过调整带。信号和仓位调整均在下一交易日开盘执行，页面不会自动下单。")
+        st.caption(f"判断顺序：先判断推荐持仓是否变化；若持仓未变，再使用当前收盘后的最近20日波动率判断下一交易日仓位偏离是否超过调整带。信号和仓位调整均按{execution_caption(latest_settings)}，页面不会自动下单。")
         position_display = position_table.copy()
         for column in ["组合估计年化波动率", "目标波动率", "目标总仓位", "目标现金比例", "当前策略总仓位", "仓位偏离", "仓位调整带"]:
             position_display[column] = position_display[column].map(pct)
@@ -689,7 +728,7 @@ def main() -> None:
 3. R² 可以过滤斜率较高但路径杂乱、趋势质量较差的标的；
 4. 当趋势失效、标的过热或所有标的都没有正动量时，降低风险或持有现金。
 
-策略使用复权后的收盘价计算信号，使用下一交易日开盘价执行交易，因此不会使用当日收盘后才知道的价格去完成当日交易。
+策略使用复权后的收盘价计算信号，并在下一交易日按用户选择的成交价格模型执行交易。默认模型为下一交易日开盘价，因此不会使用信号日收盘后才知道的价格完成信号日交易。
 
 ### 二、动量分数的公式
 
@@ -774,7 +813,7 @@ MomentumScore = [exp(β₁ × 252) - 1] × R² × 100
 - 当前第一名未过热时继续持有；
 - 新第一名只有超过换仓缓冲才替换；
 - 如果所有分数都不为正，则持有现金；
-- 信号在下一交易日开盘执行。
+- 信号在用户选择的下一交易日成交时点执行，默认是下一交易日开盘。
 
 这里的“熔断”是策略内部的风险过滤标准，不是交易所的涨跌停熔断机制。
 
@@ -790,7 +829,20 @@ Score ≤ 0  →  不参与有效候选排名
 目标持仓 = 现金
 ```
 
-现金切换在下一交易日开盘完成。
+现金切换在用户选择的下一交易日成交时点完成。
+
+#### 4. 成交价格模型
+
+回测中的“执行日价格”是成交假设，不等于保证能够成交的实际价格。当前页面提供两种基准：
+
+1. **下一交易日开盘价**：与原项目口径一致，适合做基准回测；
+2. **下一交易日 OHLC 典型价**：
+
+```text
+TypicalPrice = (Open + High + Low + Close) / 4
+```
+
+它只是日线数据下对盘中平均成交价的粗略代理，不是真实 VWAP，不能替代分钟级成交数据。典型价只应作为成交价格敏感性分析，不应解释为实际保证成交价。
 
 #### 2. 过热阈值
 
@@ -868,13 +920,13 @@ wᵢ = 1 / N
 
 如果当前没有持有新目标标的，仍然可以计算仓位：直接使用新目标标的过去20个交易日的波动率决定首次买入金额，不需要先持有一段时间。例如，新标的估计波动率为60%，目标波动率为20%，首次建仓目标总仓位约为33.33%，剩余资金保留为现金。
 
-如果当前已经持有标的，且没有发生换标的信号，则目标标的保持不变，但每天重新计算该标的最新20日波动率。若当前仓位与新目标仓位的偏离不超过10个百分点，则不交易；超过10个百分点时，下一交易日开盘增仓或减仓。也就是说，仓位管理可以在持有同一标的期间单独触发，而不需要等待换标的。
+如果当前已经持有标的，且没有发生换标的信号，则目标标的保持不变，但每天重新计算该标的最新20日波动率。若当前仓位与新目标仓位的偏离不超过10个百分点，则不交易；超过10个百分点时，在用户选择的下一交易日成交时点增仓或减仓。也就是说，仓位管理可以在持有同一标的期间单独触发，而不需要等待换标的。
 
 ### 五、仓位调整带与两种调整情形
 
 如果每天都根据估计波动率微调仓位，短期噪声会产生大量交易。仓位调整带就是允许实际仓位在目标仓位附近小幅偏离，只有偏离超过阈值才执行再平衡。
 
-本项目的10%调整带表示：当实际总仓位或标的权重与目标权重的最大偏离不超过10个百分点时，暂不调整；超过10个百分点时，才在下一交易日开盘调整。形式化表示为：
+本项目的10%调整带表示：当实际总仓位或标的权重与目标权重的最大偏离不超过10个百分点时，暂不调整；超过10个百分点时，才在用户选择的下一交易日成交时点调整。形式化表示为：
 
 ```text
 max( |wᵢ,current - wᵢ,target|,
@@ -889,7 +941,7 @@ max( |wᵢ,current - wᵢ,target|,
 
 ```text
 TargetExposure = min(100%, 20% / σ_B)
-TargetValue_B = NAV_open × TargetExposure
+TargetValue_B = NAV_before × TargetExposure
 ```
 
 先卖出旧标的，再按目标金额买入新标的，剩余金额保留为现金。新标的不需要先持有一段时间才能计算仓位。
@@ -899,7 +951,7 @@ TargetValue_B = NAV_open × TargetExposure
 如果排名和持仓标的没有变化，策略每天仍会重新计算该标的（或目标组合）的最新20日波动率：
 
 ```text
-CurrentExposure = 持仓开盘市值 / 调仓前开盘净值
+CurrentExposure = 持仓执行价市值 / 调仓前执行价净值
 Gap = CurrentExposure - TargetExposure
 ```
 
@@ -916,20 +968,24 @@ Gap = CurrentExposure - TargetExposure
 
 记录中的“目标总仓位”是风险模型希望持有的资产比例；“调仓前总仓位”和“调仓后总仓位”用于核对仓位调整是否达到目标；“仓位变化”表示本次实际增加或减少的资产比例。
 
-调仓金额和净值字段的计算方式为：
+调仓金额和净值字段的计算方式为（`P_exec`为用户选择的执行价格）：
 
 ```text
-NAV_open = Cash + Σ(qᵢ × Pᵢ,open)
-调仓前总仓位 = Σ(qᵢ × Pᵢ,open) / NAV_open
+NAV_before = Cash + Σ(qᵢ × Pᵢ,exec)
+调仓前总仓位 = Σ(qᵢ × Pᵢ,exec) / NAV_before
 ```
 
-成交后，扣除买卖手续费并按同一开盘价重估：
+成交后，扣除买卖手续费并按执行基准价格重估：
 
 ```text
-NAV_after = Cash_after + Σ(qᵢ,after × Pᵢ,open)
-调仓后总仓位 = Σ(qᵢ,after × Pᵢ,open) / NAV_after
-调仓净值影响 = NAV_after / NAV_open - 1
+NAV_after = Cash_after + Σ(qᵢ,after × Pᵢ,exec)
+调仓后总仓位 = Σ(qᵢ,after × Pᵢ,exec) / NAV_after
+调仓净值影响 = NAV_after / NAV_before - 1
+调仓间收益率 = NAV_before,current / NAV_after,previous - 1
 ```
+
+其中，`NAV_after,previous` 是上一次实际调仓完成后的执行价净值，
+`NAV_before,current` 是本次调仓前按当前成交价格重估的组合净值；这里不使用上一次调仓日的收盘净值作为收益起点。
 
 当前单边手续费为 `0.05%`：
 
@@ -939,7 +995,7 @@ NAV_after = Cash_after + Σ(qᵢ,after × Pᵢ,open)
 
 “信号调仓”表示目标标的发生变化；“风险仓位再平衡”表示目标标的没有变化，但波动率模型导致仓位偏离超过调整带。每行调仓汇总记录代表一次实际执行事件，买卖名称、价格和金额会分别列在卖出明细和买入明细中。
 
-“本次调仓前组合收益率”反映从上次实际调仓后到本次调仓前，组合已经取得的收益或亏损；“调仓净值影响”反映按成交价格完成本次交易后净值的即时变化，主要是手续费影响。因此，调仓记录既能看到调仓发生前组合表现，也能看到仓位管理是否导致了增仓、减仓以及交易成本。
+“本次调仓前组合收益率”反映从上一次实际调仓完成后的执行价净值，到本次调仓前按当前执行价重估的组合收益或亏损；“调仓净值影响”反映按成交价格完成本次交易后净值的即时变化，主要是手续费影响。因此，调仓记录既能看到两个调仓之间的完整持有表现，也能看到本次仓位管理是否导致了增仓、减仓以及交易成本。
 """)
         st.subheader("结合当前数据的实际计算示例")
         explanation_settings = mode_settings("均衡仓位（目标波动率20%）")

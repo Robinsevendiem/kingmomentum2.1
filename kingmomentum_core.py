@@ -147,6 +147,34 @@ def _price(data: dict[str, pd.DataFrame], symbol: str, day: pd.Timestamp, field:
     return None
 
 
+EXECUTION_PRICE_MODES = {
+    "open": "执行日开盘价",
+    "typical": "执行日OHLC典型价（四价均值）",
+}
+
+
+def _execution_base_price(
+    data: dict[str, pd.DataFrame], symbol: str, day: pd.Timestamp, mode: str
+) -> float | None:
+    """Return the observable daily price used as the execution reference.
+
+    ``open`` is the current project baseline. ``typical`` is an OHLC proxy for
+    sensitivity analysis; it is not a true intraday VWAP.
+    """
+    if mode not in EXECUTION_PRICE_MODES:
+        raise ValueError(f"未知成交价格模式：{mode}")
+    if mode == "open":
+        return _price(data, symbol, day, mode)
+    frame = data[symbol]
+    if day not in frame.index:
+        return None
+    row = frame.loc[day, ["open", "high", "low", "close"]]
+    values = pd.to_numeric(row, errors="coerce")
+    if not np.isfinite(values.to_numpy(dtype=float)).all() or (values <= 0).any():
+        return None
+    return float(values.mean())
+
+
 def _prior_vol(data: dict[str, pd.DataFrame], symbol: str, day: pd.Timestamp, lookback: int = 20) -> float:
     frame = data[symbol]
     close = frame.loc[frame.index < day, "close"]
@@ -429,6 +457,7 @@ def backtest(
     buffer: float = 5.0,
     cutoff: float = 500.0,
     fee: float = 0.0005,
+    execution_price_mode: str = "open",
     target_volatility: float | None = 0.15,
     rebalance_band: float = 0.10,
     volatility_lookback: int = 20,
@@ -450,6 +479,8 @@ def backtest(
     recovery_uses_raw_target_for_band: bool = False,
     initial: float = 100_000.0,
 ) -> tuple[dict[str, float | str], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if execution_price_mode not in EXECUTION_PRICE_MODES:
+        raise ValueError(f"未知成交价格模式：{execution_price_mode}")
     if volatility_lookback < 2:
         raise ValueError("波动率回看窗口至少需要2个交易日")
     if shock_short_window < 2 or shock_long_window <= shock_short_window:
@@ -478,15 +509,16 @@ def backtest(
     pending_signal_day: date | None = None
     pending_reason = "建立新仓位"
     pending_scores: dict[str, float] = {}
+    # 上一次实际调仓完成时的净值，按当次成交价格重估；用于计算完整的调仓间收益。
     last_rebalance_nav: float | None = None
     shock_active = False
     shock_recovery_count = 0
 
     for day in dates:
-        open_values = {x: holdings[x] * (_price(data, x, day, "open") or 0.0) for x in holdings}
-        nav_open = cash + sum(open_values.values())
+        execution_values = {x: holdings[x] * (_execution_base_price(data, x, day, execution_price_mode) or 0.0) for x in holdings}
+        nav_open = cash + sum(execution_values.values())
         pre_holdings = dict(holdings)
-        pre_exposure = sum(open_values.values()) / nav_open if nav_open else 0.0
+        pre_exposure = sum(execution_values.values()) / nav_open if nav_open else 0.0
         trade_start = len(trades)
         target_exposure = 1.0
         target_weights = pd.Series(1.0 / len(pending), index=pending, dtype=float) if pending else pd.Series(dtype=float)
@@ -542,7 +574,7 @@ def backtest(
         target_weights *= target_exposure
         desired_values = nav_open * target_weights
         if pending and holdings and set(pending) == set(holdings) and rebalance_band > 0:
-            current_weights = pd.Series(open_values) / nav_open if nav_open else pd.Series(dtype=float)
+            current_weights = pd.Series(execution_values) / nav_open if nav_open else pd.Series(dtype=float)
             union = current_weights.index.union(target_weights.index)
             gap = (current_weights.reindex(union).fillna(0) - target_weights.reindex(union).fillna(0)).abs().max()
             cash_gap = abs(cash / nav_open - (1.0 - target_weights.sum())) if nav_open else 0.0
@@ -553,11 +585,11 @@ def backtest(
                 and raw_target_exposure_for_recovery - pre_exposure > rebalance_band
             )
             if max(float(gap), float(cash_gap)) <= rebalance_band and not recovery_triggered:
-                desired_values = pd.Series(open_values).reindex(pending).fillna(0.0)
+                desired_values = pd.Series(execution_values).reindex(pending).fillna(0.0)
 
         def sell(symbol: str, shares: float, reason: str, trade_day: pd.Timestamp = day) -> None:
             nonlocal cash
-            price = _price(data, symbol, trade_day, "open")
+            price = _execution_base_price(data, symbol, trade_day, execution_price_mode)
             if price is None or shares <= 0:
                 return
             amount = shares * price
@@ -571,7 +603,7 @@ def backtest(
 
         def buy(symbol: str, shares: float, reason: str, trade_day: pd.Timestamp = day) -> None:
             nonlocal cash
-            price = _price(data, symbol, trade_day, "open")
+            price = _execution_base_price(data, symbol, trade_day, execution_price_mode)
             if price is None or shares <= 0:
                 return
             shares = min(shares, cash / (price * (1.0 + fee)))
@@ -585,17 +617,17 @@ def backtest(
         if not pending:
             for symbol in list(holdings):
                 sell(symbol, holdings[symbol], "转入现金")
-        elif all(_price(data, symbol, day, "open") is not None for symbol in pending):
+        elif all(_execution_base_price(data, symbol, day, execution_price_mode) is not None for symbol in pending):
             for symbol in list(holdings):
                 if symbol not in pending:
                     sell(symbol, holdings[symbol], "调仓替换")
             for symbol in list(holdings):
-                price = _price(data, symbol, day, "open")
+                price = _execution_base_price(data, symbol, day, execution_price_mode)
                 target = float(desired_values.get(symbol, 0.0))
                 if price and holdings[symbol] * price > target:
                     sell(symbol, holdings[symbol] - target / price, "风险再平衡")
             for symbol in pending:
-                price = _price(data, symbol, day, "open")
+                price = _execution_base_price(data, symbol, day, execution_price_mode)
                 target = float(desired_values.get(symbol, 0.0))
                 current_value = holdings.get(symbol, 0.0) * (price or 0.0)
                 if price and current_value < target:
@@ -604,9 +636,9 @@ def backtest(
         day_trades = trades[trade_start:]
         event_row: dict[str, object] | None = None
         if day_trades:
-            post_open_values = {x: holdings[x] * (_price(data, x, day, "open") or 0.0) for x in holdings}
-            nav_after_trade = cash + sum(post_open_values.values())
-            post_exposure = sum(post_open_values.values()) / nav_after_trade if nav_after_trade else 0.0
+            post_execution_values = {x: holdings[x] * (_execution_base_price(data, x, day, execution_price_mode) or 0.0) for x in holdings}
+            nav_after_trade = cash + sum(post_execution_values.values())
+            post_exposure = sum(post_execution_values.values()) / nav_after_trade if nav_after_trade else 0.0
             trade_reasons = {str(trade["原因"]) for trade in day_trades}
             signal_rebalance = set(pre_holdings) != set(pending)
             if signal_rebalance:
@@ -667,7 +699,9 @@ def backtest(
             pending = selected
         if event_row is not None:
             event_row["调仓后收盘净值"] = nav_close
-            last_rebalance_nav = nav_close
+            # 收益区间的起点应为上一次调仓完成后的执行价净值，而不是
+            # 上一次调仓日收盘后的净值。这样会纳入调仓完成后至当日收盘的持仓收益。
+            last_rebalance_nav = float(event_row["调仓后净值"])
 
     value_frame = pd.DataFrame(values).set_index("日期")
     trade_frame = pd.DataFrame(trades)
