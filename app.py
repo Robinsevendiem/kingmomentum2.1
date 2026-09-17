@@ -15,6 +15,7 @@ from kingmomentum_core import (
     ASSETS,
     EXECUTION_PRICE_MODES,
     coverage_table,
+    fetch_free_quote,
     fetch_symbol_with_pandadata,
     fetch_symbol_with_tushare,
     latest_signal,
@@ -25,6 +26,7 @@ from kingmomentum_core import (
     refresh_with_pandadata,
     refresh_with_tushare,
     score_panel,
+    simulate_close_data,
     backtest,
 )
 
@@ -53,6 +55,19 @@ def cached_data() -> dict:
 @st.cache_data(show_spinner=False)
 def cached_scores(data: dict) -> object:
     return score_panel(data, window=25)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_free_quotes(symbols: tuple[str, ...]) -> tuple[dict, dict[str, str]]:
+    """Fetch the selected pool's free quotes, caching them for at most one minute."""
+    quotes: dict = {}
+    errors: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            quotes[symbol] = fetch_free_quote(symbol)
+        except Exception as exc:
+            errors[symbol] = str(exc)
+    return quotes, errors
 
 
 def pandadata_credentials() -> tuple[str, str]:
@@ -659,6 +674,69 @@ def main() -> None:
                 st.caption("Tushare 更新会全量下载当前标的池并重建前复权 OHLC，以避免与 PandaData 快照混用。")
             else:
                 st.caption("PandaData 更新需要配置账号和可用 SDK；切换来源后首次更新会全量重建，避免混合两套数据。")
+        st.divider()
+        st.subheader("模拟收盘价（盘中预估）")
+        st.caption(
+            "点击后从免费行情接口获取当前未复权价，优先腾讯、失败后依次尝试新浪和东方财富；"
+            "系统会将报价换算到历史复权价格尺度，再按25日动量公式重新计算排名。"
+        )
+        if st.button("模拟当前收盘价并计算动量排名", use_container_width=True):
+            with st.spinner("正在获取免费行情并计算模拟动量分数…"):
+                quotes, quote_errors = cached_free_quotes(tuple(selected))
+            if quote_errors:
+                for symbol, error in quote_errors.items():
+                    st.error(f"{symbol} 行情获取失败：{error}")
+                st.session_state.pop("simulated_close_result", None)
+            else:
+                try:
+                    simulated_data, quote_table = simulate_close_data(data, quotes)
+                    simulated_scores = score_panel(simulated_data, window=25)
+                    score_rows = []
+                    for _, quote_row in quote_table.iterrows():
+                        symbol = str(quote_row["代码"])
+                        score = float(simulated_scores[symbol].dropna().iloc[-1])
+                        score_rows.append(
+                            {
+                                "代码": symbol,
+                                "名称": quote_row["名称"],
+                                "排名": 0,
+                                "模拟动量分数": score,
+                                "状态": "非正分" if score <= 0 else ("过热" if score > 500 else "有效候选"),
+                                "模拟收盘价（复权尺度）": quote_row["模拟收盘价（复权尺度）"],
+                                "免费行情价（未复权）": quote_row["免费行情价（未复权）"],
+                                "报价日期": quote_row["报价日期"],
+                                "来源": quote_row["来源"],
+                            }
+                        )
+                    ranking = pd.DataFrame(score_rows).sort_values("模拟动量分数", ascending=False).reset_index(drop=True)
+                    ranking["排名"] = ranking.index + 1
+                    st.session_state.simulated_close_result = {
+                        "data_signature": data_signature,
+                        "quote_table": quote_table,
+                        "ranking": ranking,
+                    }
+                except Exception as exc:
+                    st.session_state.pop("simulated_close_result", None)
+                    st.error(f"模拟收盘价计算失败：{exc}")
+
+        simulated_result = st.session_state.get("simulated_close_result")
+        if simulated_result is not None and simulated_result.get("data_signature") == data_signature:
+            ranking = simulated_result["ranking"]
+            valid_simulated = ranking[ranking["状态"] == "有效候选"]
+            simulated_choice = valid_simulated.iloc[0]["名称"] if not valid_simulated.empty else "现金"
+            st.success(f"模拟结果：排名第一的有效候选为 **{simulated_choice}**。该结果仅为盘中预估，收盘后可能变化。")
+            st.dataframe(
+                ranking.style.format(
+                    {
+                        "模拟动量分数": "{:.4f}",
+                        "模拟收盘价（复权尺度）": "{:.4f}",
+                        "免费行情价（未复权）": "{:.4f}",
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption("复权换算因子 = 最新历史复权收盘价 ÷ 免费行情接口的前收盘价；模拟结果不写入 Parquet，也不改变正式回测。")
         score_day, score_table, selected_holdings, reason = latest_signal(data, scores, as_of=analysis_end)
         full_metrics, latest_nav, _, _, _ = backtest(data, scores, start=analysis_start, end=analysis_end, **latest_settings)
         holding_day = pd.Timestamp(latest_nav["日期"].iloc[-1]).date()

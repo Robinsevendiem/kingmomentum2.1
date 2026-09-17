@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date
+import json
+import re
 import tempfile
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -24,6 +28,151 @@ ASSETS = {
 }
 DEFAULT_SYMBOLS = tuple(ASSETS)
 REQUIRED_MARKET_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def _quote_date_from_text(text: str) -> date:
+    """Extract a quote date from free-market API text, with a local fallback."""
+    match = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if match:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    compact_match = re.search(r"(20\d{2})(\d{2})(\d{2})(?:\d{6})?", text)
+    if compact_match:
+        return date(
+            int(compact_match.group(1)),
+            int(compact_match.group(2)),
+            int(compact_match.group(3)),
+        )
+    return date.today()
+
+
+def _request_quote_text(url: str, referer: str | None = None) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (KingMomentum research app)"}
+    if referer:
+        headers["Referer"] = referer
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=6) as response:
+        return response.read().decode("gb18030", errors="replace")
+
+
+def _quote_result(symbol: str, price: float, previous_close: float, text: str, source: str) -> dict[str, object]:
+    if not np.isfinite(price) or price <= 0 or not np.isfinite(previous_close) or previous_close <= 0:
+        raise ValueError(f"{source}返回了无效价格")
+    return {
+        "symbol": symbol,
+        "price": float(price),
+        "previous_close": float(previous_close),
+        "quote_date": _quote_date_from_text(text),
+        "quote_time": text,
+        "source": source,
+    }
+
+
+def _fetch_tencent_quote(symbol: str) -> dict[str, object]:
+    native = _tushare_native_symbol(symbol).lower()
+    code, market = native.split(".")
+    text = _request_quote_text(f"https://qt.gtimg.cn/q={market}{code}")
+    match = re.search(r'v_[^=]+="([^"]*)"', text)
+    if not match:
+        raise ValueError("腾讯接口未返回报价")
+    fields = match.group(1).split("~")
+    if len(fields) < 5:
+        raise ValueError("腾讯接口返回字段不足")
+    return _quote_result(symbol, float(fields[3]), float(fields[4]), text, "腾讯")
+
+
+def _fetch_sina_quote(symbol: str) -> dict[str, object]:
+    native = _tushare_native_symbol(symbol).lower()
+    code, market = native.split(".")
+    text = _request_quote_text(
+        f"https://hq.sinajs.cn/list={market}{code}",
+        referer="https://finance.sina.com.cn/",
+    )
+    match = re.search(r'="([^"]*)"', text)
+    if not match:
+        raise ValueError("新浪接口未返回报价")
+    fields = match.group(1).split(",")
+    if len(fields) < 3:
+        raise ValueError("新浪接口返回字段不足")
+    return _quote_result(symbol, float(fields[1]), float(fields[2]), text, "新浪")
+
+
+def _fetch_eastmoney_quote(symbol: str) -> dict[str, object]:
+    normalized = normalize_symbol_input(symbol)
+    if normalized is None:
+        raise ValueError(f"无法识别标的代码：{symbol}")
+    prefix, code = normalized.split(".")
+    secid = f"{'1' if prefix == 'SHSE' else '0'}.{code}"
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/get?"
+        f"secid={secid}&fields=f43,f57,f58,f60,f86"
+    )
+    text = _request_quote_text(url)
+    payload = json.loads(text)
+    item = payload.get("data") or {}
+    # Eastmoney fund/ETF prices are returned in thousandths of a yuan.
+    current = float(item["f43"]) / 1000.0
+    previous_close = float(item["f60"]) / 1000.0
+    return _quote_result(symbol, current, previous_close, text, "东方财富")
+
+
+def fetch_free_quote(symbol: str) -> dict[str, object]:
+    """Fetch one free real-time quote with Tencent/Sina/Eastmoney fallback."""
+    errors: list[str] = []
+    for fetcher in (_fetch_tencent_quote, _fetch_sina_quote, _fetch_eastmoney_quote):
+        try:
+            return fetcher(symbol)
+        except (OSError, URLError, ValueError, KeyError, json.JSONDecodeError, IndexError, TypeError) as exc:
+            errors.append(f"{fetcher.__name__.replace('_fetch_', '')}: {exc}")
+    raise RuntimeError(f"免费行情接口均未返回 {symbol} 的有效报价（{'；'.join(errors)}）")
+
+
+def simulate_close_data(
+    data: dict[str, pd.DataFrame],
+    quotes: dict[str, dict[str, object]],
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Append/replace temporary adjusted closes without writing local files."""
+    simulated_data: dict[str, pd.DataFrame] = {}
+    detail_rows: list[dict[str, object]] = []
+    for symbol, frame in data.items():
+        quote = quotes.get(symbol)
+        if quote is None:
+            raise ValueError(f"缺少 {symbol} 的免费行情")
+        simulated = frame.copy()
+        quote_date = pd.Timestamp(quote["quote_date"])
+        last_date = pd.Timestamp(simulated.index.max())
+        if quote_date < last_date:
+            raise ValueError(
+                f"{symbol} 的免费行情日期 {quote_date.date()} 早于历史快照最后日期 {last_date.date()}，报价可能已过期"
+            )
+        raw_previous_close = float(quote["previous_close"])
+        adjusted_previous_close = float(simulated["close"].iloc[-1])
+        adjustment_ratio = adjusted_previous_close / raw_previous_close
+        simulated_close = float(quote["price"]) * adjustment_ratio
+        row = simulated.iloc[-1].copy()
+        row["close"] = simulated_close
+        if quote_date > last_date:
+            row["open"] = simulated_close
+            row["high"] = simulated_close
+            row["low"] = simulated_close
+            row["volume"] = 0.0
+            row_frame = pd.DataFrame([row], index=pd.DatetimeIndex([quote_date]))
+            simulated = pd.concat([simulated, row_frame], axis=0)
+        else:
+            simulated.loc[last_date, "close"] = simulated_close
+        simulated_data[symbol] = simulated
+        detail_rows.append(
+            {
+                "代码": symbol,
+                "名称": ASSETS.get(symbol, symbol),
+                "报价日期": quote_date.date(),
+                "免费行情价（未复权）": float(quote["price"]),
+                "前收盘（未复权）": raw_previous_close,
+                "换算因子": adjustment_ratio,
+                "模拟收盘价（复权尺度）": simulated_close,
+                "来源": quote["source"],
+            }
+        )
+    return simulated_data, pd.DataFrame(detail_rows)
 
 
 def normalize_symbol_input(value: str) -> str | None:
