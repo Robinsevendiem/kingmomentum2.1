@@ -20,8 +20,10 @@
 KingMomentum_Streamlit_App/
 ├── app.py                         # Streamlit 页面
 ├── kingmomentum_core.py           # 评分、仓位管理和回测引擎
-├── data/*.parquet                 # 9个标的的调整后日线快照
+├── data/*.parquet                 # PandaData调整后日线快照
+├── data_tushare/*.parquet         # 可选：Tushare重建的独立调整后日线快照
 ├── scripts/validate_app.py        # 上传/部署前自检
+├── scripts/build_tushare_snapshot.py # 本地构建Tushare独立快照
 ├── open_kingmomentum_app.command  # macOS双击启动并打开浏览器
 ├── requirements.txt               # Streamlit运行依赖
 ├── .gitignore                     # 密钥、虚拟环境和缓存排除规则
@@ -38,6 +40,16 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/validate_app.py
 ```
+
+如需将 Tushare 数据预先下载到项目中，请在本机配置环境变量后运行：
+
+```bash
+export TUSHARE_TOKEN="你的Tushare Token"
+.venv/bin/python scripts/build_tushare_snapshot.py
+unset TUSHARE_TOKEN
+```
+
+该脚本只写入 `data_tushare/`，不会覆盖 `data/` 中的 PandaData 快照。默认沿用 PandaData 快照中每个标的的最早日期；如需统一从某日起下载，可增加 `--start-date 2017-08-01`。
 
 随后启动：
 
@@ -84,12 +96,14 @@ macOS 也可以双击 `open_kingmomentum_app.command`。脚本会检查依赖、
 3. 使用 `requirements.txt` 安装依赖；
 4. 部署后检查“回测”“最新持仓”和“策略说明”三个页面。
 
-基础应用使用仓库内置数据快照；侧边栏的“数据源”可以选择 PandaData 或 Tushare。
+如果仓库中同时提交了 `data/` 和 `data_tushare/`，网页只读取侧边栏当前选择的数据目录。部署后的常规访问直接读取仓库快照，不需要下载历史数据；建议在本地更新后再提交新的快照。
+
+基础应用使用仓库内置数据快照；侧边栏的“数据源”可以选择 PandaData 或 Tushare。两者分别读取 `data/` 和 `data_tushare/`，切换数据源不会覆盖另一套文件，也不会混合计算。
 
 在“最新持仓”页面点击“模拟当前收盘价并计算动量排名”，应用会按“腾讯 → 新浪 → 东方财富”的顺序获取免费行情。免费行情是未复权价格，应用会用“最新历史复权收盘价 ÷ 免费行情前收盘价”换算到当前快照的复权价格尺度，然后临时追加或替换收盘价并重新计算排名。模拟结果只保存在当前会话中，不写入 Parquet，也不会改变正式回测；免费接口最多缓存60秒，收盘后应以正式数据更新结果为准。
 
 - PandaData 模式使用 `panda_data.get_fund_daily_pre` 返回的前复权 OHLC。更新时默认增量拉取；从 Tushare 切换回来后的首次更新会全量重建，避免混用两套来源。
-- Tushare 模式与原项目一致：先用 `ts.pro_bar(adj=None, asset="FD")` 获取原始行情，再用 `pro.fund_adj` 获取复权因子，最后按 `raw_price * adj_factor / latest_adj_factor` 在本地重建前复权 OHLC。每次 Tushare 更新都会全量重建当前标的池。
+- Tushare 模式与原项目一致：先用 `ts.pro_bar(adj=None, asset="FD")` 获取原始行情，再用 `pro.fund_adj` 获取复权因子，最后按 `raw_price * adj_factor / latest_adj_factor` 在本地重建前复权 OHLC，并保存到独立的 `data_tushare/`。每次 Tushare 更新都会全量重建当前标的池，但不会覆盖 `data/`。
 
 侧边栏新增标的时，也会按当前选择的数据源获取该标的从允许起始日开始的历史数据。Streamlit 的 `Settings → Secrets` 中配置：
 

@@ -1114,7 +1114,13 @@ def refresh_with_tushare(
     requested = tuple(DEFAULT_SYMBOLS if symbols is None else symbols)
     updated = 0
     for symbol in requested:
-        frame = fetch_symbol_with_tushare(symbol, token, start, end)
+        rebuild_start = start
+        existing_path = data_dir / f"{symbol}.parquet"
+        if existing_path.exists():
+            existing = load_data(data_dir, symbols=[symbol])[symbol]
+            if not existing.empty:
+                rebuild_start = min(start, existing.index.min().date())
+        frame = fetch_symbol_with_tushare(symbol, token, rebuild_start, end)
         frame.to_parquet(data_dir / f"{symbol}.parquet")
         updated += 1
     return updated, end.isoformat()

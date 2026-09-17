@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import date, datetime
 from pathlib import Path
@@ -33,7 +32,11 @@ from kingmomentum_core import (
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
-DATA_SOURCE_MARKER = DATA_DIR / ".data_source.json"
+TUSHARE_DATA_DIR = APP_DIR / "data_tushare"
+DATA_SOURCE_DIRS = {
+    "pandadata": DATA_DIR,
+    "tushare": TUSHARE_DATA_DIR,
+}
 EARLIEST_BACKTEST_START = date(2017, 8, 1)
 POSITION_MODES = ["均衡仓位（目标波动率20%）", "防守仓位（目标波动率15%）", "原始满仓/现金"]
 POSITION_MODE_OPTIONS = [*POSITION_MODES, "自定义"]
@@ -48,8 +51,8 @@ DATA_SOURCE_OPTIONS = {
 
 
 @st.cache_data(show_spinner=False)
-def cached_data() -> dict:
-    return load_data(DATA_DIR)
+def cached_data(data_dir: str) -> dict:
+    return load_data(Path(data_dir))
 
 
 @st.cache_data(show_spinner=False)
@@ -89,26 +92,6 @@ def tushare_token() -> str:
     except Exception:
         token = ""
     return str(token or os.getenv("TUSHARE_TOKEN", "")).strip()
-
-
-def stored_data_source() -> str:
-    """Read the source used to create the current runtime snapshot."""
-    try:
-        payload = json.loads(DATA_SOURCE_MARKER.read_text(encoding="utf-8"))
-        source = str(payload.get("source", "")).strip().lower()
-        return source if source in DATA_SOURCE_OPTIONS.values() else "pandadata"
-    except Exception:
-        # Existing bundled snapshots predate the marker and are PandaData snapshots.
-        return "pandadata"
-
-
-def save_data_source(source: str) -> None:
-    """Record the source of the successfully rebuilt runtime snapshot."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_SOURCE_MARKER.write_text(
-        json.dumps({"source": source}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
 
 
 def pct(value: float | None) -> str:
@@ -154,7 +137,13 @@ def resolve_symbol_input(value: str) -> str | None:
     return normalize_symbol_input(value)
 
 
-def add_symbol_to_session(input_code: str, input_name: str, all_data: dict, data_source: str) -> str:
+def add_symbol_to_session(
+    input_code: str,
+    input_name: str,
+    all_data: dict,
+    data_source: str,
+    data_dir: Path,
+) -> str:
     """Load a local file or fetch an unbundled symbol into this Streamlit session."""
     symbol = resolve_symbol_input(input_code)
     if symbol is None:
@@ -162,9 +151,9 @@ def add_symbol_to_session(input_code: str, input_name: str, all_data: dict, data
     if symbol in all_data:
         return symbol
 
-    local_path = DATA_DIR / f"{symbol}.parquet"
+    local_path = data_dir / f"{symbol}.parquet"
     if local_path.exists():
-        frame = load_data(DATA_DIR, symbols=[symbol])[symbol]
+        frame = load_data(data_dir, symbols=[symbol])[symbol]
     elif data_source == "tushare":
         token = tushare_token()
         if not token:
@@ -396,13 +385,33 @@ def main() -> None:
     st.set_page_config(page_title="KingMomentum ETF轮动", page_icon="📈", layout="wide")
     st.title("KingMomentum ETF / LOF 轮动策略")
     st.caption("25个交易日对数价格加权线性回归 · 收盘计算信号 · 可选择下一交易日的成交价格模型")
+    with st.sidebar:
+        st.header("策略与数据")
+        page = st.radio("页面", ["回测", "最新持仓", "策略说明"], index=0)
+        data_source_label = st.selectbox(
+            "数据源",
+            list(DATA_SOURCE_OPTIONS),
+            index=0,
+            key="data_source_label",
+            help="选择当前使用的本地数据目录及后续更新、新增标的数据源。两套快照相互独立。",
+        )
+    data_source = DATA_SOURCE_OPTIONS[data_source_label]
+    data_dir = DATA_SOURCE_DIRS[data_source]
     try:
-        bundled_data = cached_data()
+        bundled_data = cached_data(str(data_dir))
+    except FileNotFoundError as exc:
+        st.error(f"{data_source_label}尚未准备好本地快照：{exc}。请先在本地完成该数据源的全量下载。")
+        st.stop()
     except Exception as exc:
-        st.error(f"数据读取失败：{exc}")
+        st.error(f"{data_source_label}数据读取失败：{exc}")
         st.stop()
 
     # 新增标的数据只保存在当前 Streamlit 会话，避免向云端仓库写文件。
+    dynamic_data_sources = st.session_state.get("dynamic_data_sources", {})
+    if dynamic_data_sources and any(source != data_source for source in dynamic_data_sources.values()):
+        st.session_state.pop("dynamic_data", None)
+        st.session_state.pop("dynamic_data_sources", None)
+        st.info("已切换数据源，已清除上一数据源会话中临时加入的标的，避免两套数据混用。")
     dynamic_data = st.session_state.get("dynamic_data", {})
     symbol_names = st.session_state.get("symbol_names", {})
     for symbol, name in symbol_names.items():
@@ -412,26 +421,12 @@ def main() -> None:
         ASSETS.setdefault(symbol, symbol_names.get(symbol, f"新增标的 {symbol.split('.')[-1]}"))
 
     with st.sidebar:
-        st.header("策略与数据")
-        page = st.radio("页面", ["回测", "最新持仓", "策略说明"], index=0)
-        data_source_label = st.selectbox(
-            "数据源",
-            list(DATA_SOURCE_OPTIONS),
-            index=0,
-            key="data_source_label",
-            help="选择数据更新和新增标的时使用的数据源；已有本地快照不会因切换而自动重建。",
-        )
-        data_source = DATA_SOURCE_OPTIONS[data_source_label]
-        current_snapshot_source = stored_data_source()
-        source_changed = current_snapshot_source != data_source
         if data_source == "tushare":
-            st.caption("Tushare 模式：原始行情 + fund_adj 复权因子，按原项目公式本地重建前复权 OHLC。")
+            st.caption("Tushare 模式：读取 data_tushare/；原始行情 + fund_adj 复权因子按原项目公式重建。")
             if not tushare_token():
-                st.warning("尚未检测到 TUSHARE_TOKEN；更新数据或新增标的前请先配置密钥。")
+                st.info("当前使用已部署的 Tushare 本地快照；如需在线更新或新增标的，再配置 TUSHARE_TOKEN。")
         else:
-            st.caption("PandaData 模式：直接使用 get_fund_daily_pre 返回的前复权 OHLC。")
-        if source_changed:
-            st.warning("数据源已切换；当前页面仍使用已加载快照，请在“最新持仓”页面点击“更新数据”后再进行跨来源比较。")
+            st.caption("PandaData 模式：读取 data/；直接使用 get_fund_daily_pre 返回的前复权 OHLC。")
         if "selected_symbols" not in st.session_state:
             st.session_state.selected_symbols = list(bundled_data)
         st.session_state.selected_symbols = [symbol for symbol in st.session_state.selected_symbols if symbol in all_data]
@@ -448,12 +443,7 @@ def main() -> None:
             add_symbol = st.form_submit_button("加入标的池")
         if add_symbol:
             try:
-                if source_changed:
-                    raise RuntimeError(
-                        f"当前 Parquet 快照来自 {current_snapshot_source}。请先在“最新持仓”页面点击“更新数据”，"
-                        "完成当前来源的全量重建后再加入新标的。"
-                    )
-                symbol = add_symbol_to_session(input_code, input_name, all_data, data_source)
+                symbol = add_symbol_to_session(input_code, input_name, all_data, data_source, data_dir)
             except Exception as exc:
                 st.error(f"加入失败：{exc}")
             else:
@@ -643,7 +633,7 @@ def main() -> None:
                 try:
                     if data_source == "tushare":
                         count, updated_to = refresh_with_tushare(
-                            DATA_DIR,
+                            data_dir,
                             tushare_token(),
                             EARLIEST_BACKTEST_START,
                             date.today(),
@@ -653,16 +643,15 @@ def main() -> None:
                     else:
                         username, password = pandadata_credentials()
                         count, updated_to = refresh_with_pandadata(
-                            DATA_DIR,
+                            data_dir,
                             username,
                             password,
                             EARLIEST_BACKTEST_START,
                             date.today(),
                             symbols=tuple(bundled_data),
-                            full_rebuild=source_changed,
+                            full_rebuild=False,
                         )
-                        rebuild_note = "已全量重建 PandaData 快照" if source_changed else "已增量更新 PandaData 快照"
-                    save_data_source(data_source)
+                        rebuild_note = "已增量更新 PandaData 快照"
                     st.success(f"已更新 {count} 个标的，目标日期：{updated_to}；{rebuild_note}。")
                     cached_data.clear()
                     cached_scores.clear()
@@ -671,9 +660,9 @@ def main() -> None:
                     st.error(f"更新失败：{exc}")
         with c2:
             if data_source == "tushare":
-                st.caption("Tushare 更新会全量下载当前标的池并重建前复权 OHLC，以避免与 PandaData 快照混用。")
+                st.caption("Tushare 更新会全量下载当前标的池，并写入独立的 data_tushare/，不会覆盖 PandaData 的 data/。")
             else:
-                st.caption("PandaData 更新需要配置账号和可用 SDK；切换来源后首次更新会全量重建，避免混合两套数据。")
+                st.caption("PandaData 更新只读写 data/，不会覆盖或混用 data_tushare/。")
         st.divider()
         st.subheader("模拟收盘价（盘中预估）")
         st.caption(
