@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime
 from pathlib import Path
@@ -15,12 +16,14 @@ from kingmomentum_core import (
     EXECUTION_PRICE_MODES,
     coverage_table,
     fetch_symbol_with_pandadata,
+    fetch_symbol_with_tushare,
     latest_signal,
     load_data,
     normalize_symbol_input,
     portfolio_volatility,
     position_management_snapshot,
     refresh_with_pandadata,
+    refresh_with_tushare,
     score_panel,
     backtest,
 )
@@ -28,12 +31,17 @@ from kingmomentum_core import (
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
+DATA_SOURCE_MARKER = DATA_DIR / ".data_source.json"
 EARLIEST_BACKTEST_START = date(2017, 8, 1)
 POSITION_MODES = ["均衡仓位（目标波动率20%）", "防守仓位（目标波动率15%）", "原始满仓/现金"]
 POSITION_MODE_OPTIONS = [*POSITION_MODES, "自定义"]
 EXECUTION_PRICE_OPTIONS = {
     "下一交易日开盘价（当前基准）": "open",
     "下一交易日OHLC典型价（敏感性分析）": "typical",
+}
+DATA_SOURCE_OPTIONS = {
+    "PandaData（当前项目数据源）": "pandadata",
+    "Tushare（与原项目一致）": "tushare",
 }
 
 
@@ -57,6 +65,35 @@ def pandadata_credentials() -> tuple[str, str]:
         username = ""
         password = ""
     return str(username or os.getenv("PANDA_DATA_USERNAME", "")), str(password or os.getenv("PANDA_DATA_PASSWORD", ""))
+
+
+def tushare_token() -> str:
+    """Read Tushare token from Streamlit Secrets, with local env fallback."""
+    try:
+        token = st.secrets.get("TUSHARE_TOKEN", "")
+    except Exception:
+        token = ""
+    return str(token or os.getenv("TUSHARE_TOKEN", "")).strip()
+
+
+def stored_data_source() -> str:
+    """Read the source used to create the current runtime snapshot."""
+    try:
+        payload = json.loads(DATA_SOURCE_MARKER.read_text(encoding="utf-8"))
+        source = str(payload.get("source", "")).strip().lower()
+        return source if source in DATA_SOURCE_OPTIONS.values() else "pandadata"
+    except Exception:
+        # Existing bundled snapshots predate the marker and are PandaData snapshots.
+        return "pandadata"
+
+
+def save_data_source(source: str) -> None:
+    """Record the source of the successfully rebuilt runtime snapshot."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_SOURCE_MARKER.write_text(
+        json.dumps({"source": source}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def pct(value: float | None) -> str:
@@ -102,7 +139,7 @@ def resolve_symbol_input(value: str) -> str | None:
     return normalize_symbol_input(value)
 
 
-def add_symbol_to_session(input_code: str, input_name: str, all_data: dict) -> str:
+def add_symbol_to_session(input_code: str, input_name: str, all_data: dict, data_source: str) -> str:
     """Load a local file or fetch an unbundled symbol into this Streamlit session."""
     symbol = resolve_symbol_input(input_code)
     if symbol is None:
@@ -113,6 +150,15 @@ def add_symbol_to_session(input_code: str, input_name: str, all_data: dict) -> s
     local_path = DATA_DIR / f"{symbol}.parquet"
     if local_path.exists():
         frame = load_data(DATA_DIR, symbols=[symbol])[symbol]
+    elif data_source == "tushare":
+        token = tushare_token()
+        if not token:
+            raise RuntimeError(
+                "该标的不在仓库内置快照中。请先在 Streamlit Settings → Secrets 配置 "
+                "TUSHARE_TOKEN，再重新加入。"
+            )
+        with st.spinner(f"正在从 Tushare 获取 {symbol} 的历史日线并重建前复权价格…"):
+            frame = fetch_symbol_with_tushare(symbol, token, EARLIEST_BACKTEST_START, date.today())
     else:
         username, password = pandadata_credentials()
         if not username or not password:
@@ -126,6 +172,7 @@ def add_symbol_to_session(input_code: str, input_name: str, all_data: dict) -> s
     name = input_name.strip() or f"新增标的 {symbol.split('.')[1]}"
     st.session_state.setdefault("dynamic_data", {})[symbol] = frame
     st.session_state.setdefault("symbol_names", {})[symbol] = name
+    st.session_state.setdefault("dynamic_data_sources", {})[symbol] = data_source
     ASSETS[symbol] = name
     return symbol
 
@@ -352,6 +399,24 @@ def main() -> None:
     with st.sidebar:
         st.header("策略与数据")
         page = st.radio("页面", ["回测", "最新持仓", "策略说明"], index=0)
+        data_source_label = st.selectbox(
+            "数据源",
+            list(DATA_SOURCE_OPTIONS),
+            index=0,
+            key="data_source_label",
+            help="选择数据更新和新增标的时使用的数据源；已有本地快照不会因切换而自动重建。",
+        )
+        data_source = DATA_SOURCE_OPTIONS[data_source_label]
+        current_snapshot_source = stored_data_source()
+        source_changed = current_snapshot_source != data_source
+        if data_source == "tushare":
+            st.caption("Tushare 模式：原始行情 + fund_adj 复权因子，按原项目公式本地重建前复权 OHLC。")
+            if not tushare_token():
+                st.warning("尚未检测到 TUSHARE_TOKEN；更新数据或新增标的前请先配置密钥。")
+        else:
+            st.caption("PandaData 模式：直接使用 get_fund_daily_pre 返回的前复权 OHLC。")
+        if source_changed:
+            st.warning("数据源已切换；当前页面仍使用已加载快照，请在“最新持仓”页面点击“更新数据”后再进行跨来源比较。")
         if "selected_symbols" not in st.session_state:
             st.session_state.selected_symbols = list(bundled_data)
         st.session_state.selected_symbols = [symbol for symbol in st.session_state.selected_symbols if symbol in all_data]
@@ -368,7 +433,12 @@ def main() -> None:
             add_symbol = st.form_submit_button("加入标的池")
         if add_symbol:
             try:
-                symbol = add_symbol_to_session(input_code, input_name, all_data)
+                if source_changed:
+                    raise RuntimeError(
+                        f"当前 Parquet 快照来自 {current_snapshot_source}。请先在“最新持仓”页面点击“更新数据”，"
+                        "完成当前来源的全量重建后再加入新标的。"
+                    )
+                symbol = add_symbol_to_session(input_code, input_name, all_data, data_source)
             except Exception as exc:
                 st.error(f"加入失败：{exc}")
             else:
@@ -378,7 +448,9 @@ def main() -> None:
                     st.rerun()
                 else:
                     st.info("该标的已经在当前标的池中。")
-        st.caption("内置9个标的可直接使用；新增代码将通过 PandaData 获取历史数据，并仅在当前会话保留。")
+        st.caption(
+            "内置9个标的可直接使用；新增代码将通过当前选择的数据源获取历史数据，并仅在当前会话保留。"
+        )
         selected = st.session_state.selected_symbols
         if not selected:
             st.warning("请至少选择一个标的")
@@ -466,7 +538,7 @@ def main() -> None:
         cols = st.columns(len(cards))
         for col, (label, value) in zip(cols, cards):
             col.metric(label, value)
-        st.caption(f"回测区间：{start} 至 {end}。数据来自调整后日线快照；策略在首个信号日后按{execution_caption(settings)}。")
+        st.caption(f"回测区间：{start} 至 {end}。当前快照来源：{data_source_label}；策略在首个信号日后按{execution_caption(settings)}。")
         st.plotly_chart(nav_chart(nav), use_container_width=True)
         st.plotly_chart(drawdown_chart(nav), use_container_width=True)
         st.subheader("调仓记录")
@@ -548,29 +620,45 @@ def main() -> None:
                 f"本页将展示该回测区间 **{analysis_start} 至 {analysis_end}** 内最后一个交易日的持仓。"
             )
         else:
-            st.write(f"当前数据最新日期：**{latest_data_date}**。最新持仓使用各标的最近可用收盘数据计算。")
+            st.write(f"当前数据最新日期：**{latest_data_date}**。当前快照来源：**{data_source_label}**；最新持仓使用各标的最近可用收盘数据计算。")
         latest_mode, latest_settings, latest_mode_label = position_mode_controls(st, "最新持仓仓位模式", "latest_position")
         c1, c2 = st.columns([1, 3])
         with c1:
             if st.button("更新数据", type="primary"):
-                username, password = pandadata_credentials()
                 try:
-                    count, updated_to = refresh_with_pandadata(
-                        DATA_DIR,
-                        username,
-                        password,
-                        EARLIEST_BACKTEST_START,
-                        date.today(),
-                        symbols=tuple(bundled_data),
-                    )
-                    st.success(f"已更新 {count} 个标的，目标日期：{updated_to}")
+                    if data_source == "tushare":
+                        count, updated_to = refresh_with_tushare(
+                            DATA_DIR,
+                            tushare_token(),
+                            EARLIEST_BACKTEST_START,
+                            date.today(),
+                            symbols=tuple(bundled_data),
+                        )
+                        rebuild_note = "已按原项目流程全量重建前复权价格"
+                    else:
+                        username, password = pandadata_credentials()
+                        count, updated_to = refresh_with_pandadata(
+                            DATA_DIR,
+                            username,
+                            password,
+                            EARLIEST_BACKTEST_START,
+                            date.today(),
+                            symbols=tuple(bundled_data),
+                            full_rebuild=source_changed,
+                        )
+                        rebuild_note = "已全量重建 PandaData 快照" if source_changed else "已增量更新 PandaData 快照"
+                    save_data_source(data_source)
+                    st.success(f"已更新 {count} 个标的，目标日期：{updated_to}；{rebuild_note}。")
                     cached_data.clear()
                     cached_scores.clear()
                     st.rerun()
                 except Exception as exc:
                     st.error(f"更新失败：{exc}")
         with c2:
-            st.caption("更新功能需要配置 PandaData 账号和可用SDK；未配置时，应用继续使用项目内置快照。建议先在本地验证更新后的数据覆盖与完整性。")
+            if data_source == "tushare":
+                st.caption("Tushare 更新会全量下载当前标的池并重建前复权 OHLC，以避免与 PandaData 快照混用。")
+            else:
+                st.caption("PandaData 更新需要配置账号和可用 SDK；切换来源后首次更新会全量重建，避免混合两套数据。")
         score_day, score_table, selected_holdings, reason = latest_signal(data, scores, as_of=analysis_end)
         full_metrics, latest_nav, _, _, _ = backtest(data, scores, start=analysis_start, end=analysis_end, **latest_settings)
         holding_day = pd.Timestamp(latest_nav["日期"].iloc[-1]).date()
@@ -1056,8 +1144,13 @@ NAV_after = Cash_after + Σ(qᵢ,after × Pᵢ,exec)
             )
         st.subheader("标的与起始时间")
         st.dataframe(coverage_table(data), hide_index=True, use_container_width=True)
-        st.subheader("PandaData 密钥配置")
-        st.code('PANDA_DATA_USERNAME = "你的账号"\nPANDA_DATA_PASSWORD = "你的密码"', language="toml")
+        st.subheader("数据源密钥配置")
+        st.code(
+            'PANDA_DATA_USERNAME = "你的PandaData账号"\n'
+            'PANDA_DATA_PASSWORD = "你的PandaData密码"\n'
+            'TUSHARE_TOKEN = "你的Tushare Token"',
+            language="toml",
+        )
         st.caption("本地可保存到项目的 .streamlit/secrets.toml；Streamlit Cloud 请在应用 Settings → Secrets 粘贴上述 TOML。不要将密钥提交到 GitHub。")
         st.warning("本应用使用调整后日线数据进行策略研究；数据更新后应重新核验日期连续性、价格有效性和复权跳变。结果不构成投资建议。")
 

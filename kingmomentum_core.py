@@ -790,18 +790,182 @@ def refresh_with_pandadata(
     start: date,
     end: date,
     symbols: Sequence[str] | None = None,
+    full_rebuild: bool = False,
 ) -> tuple[int, str]:
     """Update the built-in snapshot, optionally restricted to given symbols."""
     requested = tuple(DEFAULT_SYMBOLS if symbols is None else symbols)
     updated = 0
     for symbol in requested:
         existing_path = data_dir / f"{symbol}.parquet"
-        existing = load_data(data_dir, symbols=[symbol])[symbol] if existing_path.exists() else pd.DataFrame()
+        existing = (
+            load_data(data_dir, symbols=[symbol])[symbol]
+            if existing_path.exists() and not full_rebuild
+            else pd.DataFrame()
+        )
         fetch_start = existing.index.max().date() + pd.Timedelta(days=1).to_pytimedelta() if not existing.empty else start
         if fetch_start > end:
             continue
         frame = fetch_symbol_with_pandadata(symbol, username, password, fetch_start, end)
         combined = pd.concat([existing, frame], axis=0) if not existing.empty else frame
         _normalize_market_frame(combined, symbol).to_parquet(existing_path)
+        updated += 1
+    return updated, end.isoformat()
+
+
+def _tushare_native_symbol(symbol: str) -> str:
+    """Convert an app symbol such as ``SHSE.518880`` to Tushare format."""
+    normalized = normalize_symbol_input(symbol)
+    if normalized is None:
+        raise ValueError(f"无法识别标的代码：{symbol}")
+    prefix, code = normalized.split(".")
+    return f"{code}.{'SH' if prefix == 'SHSE' else 'SZ'}"
+
+
+def _normalize_tushare_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Normalize a Tushare fund daily response while retaining its OHLCV."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    normalized = frame.copy()
+    if "trade_date" in normalized.columns:
+        trade_dates = normalized.pop("trade_date")
+    else:
+        trade_dates = normalized.index
+        if isinstance(normalized.index, pd.RangeIndex):
+            raise ValueError(f"Tushare {symbol} 数据缺少 trade_date")
+    normalized.index = pd.DatetimeIndex(pd.to_datetime(trade_dates)).tz_localize(None)
+    normalized = normalized[~normalized.index.duplicated(keep="last")].sort_index()
+    if "vol" in normalized.columns and "volume" not in normalized.columns:
+        normalized = normalized.rename(columns={"vol": "volume"})
+    missing = set(REQUIRED_MARKET_COLUMNS) - set(normalized.columns)
+    if missing:
+        raise ValueError(f"Tushare {symbol} 数据缺少字段：{sorted(missing)}")
+    return normalized.loc[:, list(REQUIRED_MARKET_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+
+
+def _fetch_tushare_bar_chunked(
+    ts_code: str,
+    start: date,
+    end: date,
+    chunk_days: int = 700,
+) -> pd.DataFrame:
+    """Fetch unadjusted ETF/LOF bars in chunks, matching the original project."""
+    try:
+        import tushare as ts
+    except ImportError as exc:
+        raise RuntimeError("未安装 tushare，请在 requirements.txt 中安装后重试") from exc
+
+    start_day = pd.Timestamp(start).date()
+    end_day = pd.Timestamp(end).date()
+    frames: list[pd.DataFrame] = []
+    cursor = start_day
+    while cursor <= end_day:
+        chunk_end = min(cursor + pd.Timedelta(days=chunk_days).to_pytimedelta(), end_day)
+        frame = ts.pro_bar(
+            ts_code=ts_code,
+            start_date=cursor.strftime("%Y%m%d"),
+            end_date=chunk_end.strftime("%Y%m%d"),
+            adj=None,
+            asset="FD",
+        )
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+        cursor = chunk_end + pd.Timedelta(days=1).to_pytimedelta()
+    if not frames:
+        return pd.DataFrame()
+    return _normalize_tushare_frame(pd.concat(frames, ignore_index=True), ts_code)
+
+
+def _fetch_tushare_fund_adj_chunked(
+    pro: object,
+    ts_code: str,
+    start: date,
+    end: date,
+    chunk_days: int = 1800,
+) -> pd.DataFrame:
+    """Fetch Tushare fund adjustment factors in chunks."""
+    start_day = pd.Timestamp(start).date()
+    end_day = pd.Timestamp(end).date()
+    frames: list[pd.DataFrame] = []
+    cursor = start_day
+    while cursor <= end_day:
+        chunk_end = min(cursor + pd.Timedelta(days=chunk_days).to_pytimedelta(), end_day)
+        frame = pro.fund_adj(
+            ts_code=ts_code,
+            start_date=cursor.strftime("%Y%m%d"),
+            end_date=chunk_end.strftime("%Y%m%d"),
+        )
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+        cursor = chunk_end + pd.Timedelta(days=1).to_pytimedelta()
+    if not frames:
+        return pd.DataFrame()
+    factors = pd.concat(frames, ignore_index=True)
+    if "trade_date" not in factors.columns or "adj_factor" not in factors.columns:
+        raise ValueError(f"Tushare {ts_code} 复权因子缺少 trade_date 或 adj_factor")
+    factors["trade_date"] = pd.to_datetime(factors["trade_date"].astype(str))
+    factors = factors[["trade_date", "adj_factor"]].drop_duplicates("trade_date", keep="last")
+    return factors.sort_values("trade_date")
+
+
+def _build_forward_adjusted_from_tushare_factor(
+    raw_frame: pd.DataFrame,
+    factor_frame: pd.DataFrame,
+    symbol: str,
+) -> pd.DataFrame:
+    """Rebuild Tushare-style forward-adjusted OHLC using the original formula."""
+    raw = _normalize_tushare_frame(raw_frame, symbol)
+    if raw.empty:
+        return raw
+    work = raw.reset_index(names="trade_date")
+    work["trade_date"] = pd.to_datetime(work["trade_date"])
+    factors = factor_frame.copy()
+    if factors.empty:
+        factors = pd.DataFrame({"trade_date": work["trade_date"], "adj_factor": 1.0})
+    factors["trade_date"] = pd.to_datetime(factors["trade_date"])
+    factors["adj_factor"] = pd.to_numeric(factors["adj_factor"], errors="coerce")
+    factors = factors[["trade_date", "adj_factor"]].drop_duplicates("trade_date", keep="last")
+    work = work.merge(factors, on="trade_date", how="left").sort_values("trade_date")
+    work["adj_factor"] = work["adj_factor"].ffill().bfill()
+    valid_factors = work["adj_factor"].dropna()
+    latest_factor = float(valid_factors.iloc[-1]) if not valid_factors.empty else 1.0
+    if latest_factor == 0:
+        latest_factor = 1.0
+    ratio = work["adj_factor"].astype(float) / latest_factor
+    for column in ("open", "high", "low", "close"):
+        work[column] = work[column].astype(float) * ratio
+    return _normalize_market_frame(work.drop(columns=["adj_factor"]), symbol)
+
+
+def fetch_symbol_with_tushare(symbol: str, token: str, start: date, end: date) -> pd.DataFrame:
+    """Fetch and locally reconstruct one Tushare forward-adjusted fund series."""
+    if not token or not str(token).strip():
+        raise RuntimeError("请先配置 TUSHARE_TOKEN")
+    try:
+        import tushare as ts
+    except ImportError as exc:
+        raise RuntimeError("未安装 tushare，请在 requirements.txt 中安装后重试") from exc
+    native = _tushare_native_symbol(symbol)
+    ts.set_token(str(token).strip())
+    pro = ts.pro_api(str(token).strip())
+    raw = _fetch_tushare_bar_chunked(native, start, end)
+    if raw.empty:
+        raise RuntimeError(f"Tushare 未返回 {symbol} 的原始日线数据，请检查代码、权限或上市日期")
+    factors = _fetch_tushare_fund_adj_chunked(pro, native, start, end)
+    return _build_forward_adjusted_from_tushare_factor(raw, factors, symbol)
+
+
+def refresh_with_tushare(
+    data_dir: Path,
+    token: str,
+    start: date,
+    end: date,
+    symbols: Sequence[str] | None = None,
+) -> tuple[int, str]:
+    """Fully rebuild selected Parquet snapshots with the original Tushare pipeline."""
+    requested = tuple(DEFAULT_SYMBOLS if symbols is None else symbols)
+    updated = 0
+    for symbol in requested:
+        frame = fetch_symbol_with_tushare(symbol, token, start, end)
+        frame.to_parquet(data_dir / f"{symbol}.parquet")
         updated += 1
     return updated, end.isoformat()

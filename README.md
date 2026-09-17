@@ -83,11 +83,17 @@ macOS 也可以双击 `open_kingmomentum_app.command`。脚本会检查依赖、
 3. 使用 `requirements.txt` 安装依赖；
 4. 部署后检查“回测”“最新持仓”和“策略说明”三个页面。
 
-基础应用使用仓库内置数据快照；“最新持仓 → 更新数据”会使用 `panda_data` SDK 从 PandaData 拉取增量数据。侧边栏加入内置快照之外的代码时，也会使用同一组凭据获取该标的从允许起始日开始的历史数据。Streamlit 的 `Settings → Secrets` 中配置：
+基础应用使用仓库内置数据快照；侧边栏的“数据源”可以选择 PandaData 或 Tushare。
+
+- PandaData 模式使用 `panda_data.get_fund_daily_pre` 返回的前复权 OHLC。更新时默认增量拉取；从 Tushare 切换回来后的首次更新会全量重建，避免混用两套来源。
+- Tushare 模式与原项目一致：先用 `ts.pro_bar(adj=None, asset="FD")` 获取原始行情，再用 `pro.fund_adj` 获取复权因子，最后按 `raw_price * adj_factor / latest_adj_factor` 在本地重建前复权 OHLC。每次 Tushare 更新都会全量重建当前标的池。
+
+侧边栏新增标的时，也会按当前选择的数据源获取该标的从允许起始日开始的历史数据。Streamlit 的 `Settings → Secrets` 中配置：
 
 ```toml
 PANDA_DATA_USERNAME = "你的PandaData账号"
 PANDA_DATA_PASSWORD = "你的PandaData密码"
+TUSHARE_TOKEN = "你的Tushare Token"
 ```
 
 本地配置文件路径为：
@@ -110,6 +116,6 @@ PandaData SDK 登录时会保存加密认证状态。应用已将该缓存重定
 - 默认回测最早日期为2017-08-01，尚未上市的标的不会被填充或回填；
 - 默认手续费为单边0.05%（万分之5）；默认模式为均衡仓位，即目标波动率20%、仓位调整带10%；
 - 内置数据快照覆盖至2026-08-25，实际覆盖日期以页面“标的数据覆盖”表为准；
-- 更新数据后，应重新检查日期覆盖、价格有效性、复权连续性和绩效结果。
+- 更新数据后，应重新检查日期覆盖、价格有效性、复权连续性和绩效结果。若要复现原项目，请选择 Tushare 并完成全量更新后再回测。
 
 本项目用于策略研究和展示，不构成投资建议。
