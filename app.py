@@ -17,6 +17,7 @@ from kingmomentum_core import (
     fetch_free_quote,
     fetch_symbol_with_pandadata,
     fetch_symbol_with_tushare,
+    kingmomentum_score,
     latest_signal,
     load_data,
     normalize_symbol_input,
@@ -267,6 +268,61 @@ def execution_caption(settings: dict[str, object]) -> str:
     return f"{timing}（基准：{price_label}）"
 
 
+def single_asset_charts(frame: pd.DataFrame, symbol: str) -> tuple[go.Figure, go.Figure]:
+    """Build the adjusted OHLC candlestick and 25-day score charts."""
+    chart_frame = frame.sort_index().copy()
+    chart_frame["日期"] = chart_frame.index
+    score = kingmomentum_score(chart_frame, window=25)
+    kline = go.Figure(
+        go.Candlestick(
+            x=chart_frame["日期"],
+            open=chart_frame["open"],
+            high=chart_frame["high"],
+            low=chart_frame["low"],
+            close=chart_frame["close"],
+            name="复权K线",
+        )
+    )
+    kline.update_layout(
+        title=f"{ASSETS.get(symbol, symbol)}（{symbol}）历史复权K线",
+        yaxis_title="价格",
+        xaxis_title="日期",
+        xaxis_rangeslider_visible=False,
+        xaxis_rangeselector={
+            "buttons": [
+                {"count": 3, "label": "3个月", "step": "month", "stepmode": "backward"},
+                {"count": 1, "label": "1年", "step": "year", "stepmode": "backward"},
+                {"count": 3, "label": "3年", "step": "year", "stepmode": "backward"},
+                {"step": "all", "label": "全部"},
+            ]
+        },
+        hovermode="x unified",
+        height=520,
+        margin={"l": 45, "r": 20, "t": 65, "b": 35},
+    )
+    score_chart = go.Figure(
+        go.Scatter(
+            x=chart_frame["日期"],
+            y=score,
+            mode="lines",
+            name="25日动量分数",
+            line={"color": "#1769aa", "width": 2},
+            connectgaps=False,
+        )
+    )
+    score_chart.add_hline(y=0, line_dash="dash", line_color="#777", annotation_text="现金阈值 0")
+    score_chart.add_hline(y=500, line_dash="dot", line_color="#d97706", annotation_text="过热阈值 500")
+    score_chart.update_layout(
+        title="25日动量分数走势",
+        yaxis_title="动量分数",
+        xaxis_title="日期",
+        hovermode="x unified",
+        height=380,
+        margin={"l": 45, "r": 20, "t": 65, "b": 35},
+    )
+    return kline, score_chart
+
+
 def run_strategy(data: dict, start: date, end: date, mode: str, settings: dict[str, float | None] | None = None):
     settings = mode_settings(mode) if settings is None else settings
     return backtest(data, cached_scores(data), start=start, end=end, **settings)
@@ -387,7 +443,7 @@ def main() -> None:
     st.caption("25个交易日对数价格加权线性回归 · 收盘计算信号 · 可选择下一交易日的成交价格模型")
     with st.sidebar:
         st.header("策略与数据")
-        page = st.radio("页面", ["回测", "最新持仓", "策略说明"], index=0)
+        page = st.radio("页面", ["回测", "最新持仓", "标的分析", "策略说明"], index=0)
         data_source_label = st.selectbox(
             "数据源",
             list(DATA_SOURCE_OPTIONS),
@@ -868,6 +924,42 @@ def main() -> None:
         st.dataframe(score_table.reset_index().rename(columns={"index": "代码"}), hide_index=True, use_container_width=True)
         st.subheader("标的数据覆盖")
         st.dataframe(coverage_table(data), hide_index=True, use_container_width=True)
+
+    elif page == "标的分析":
+        st.subheader("标的历史K线与动量分数")
+        default_symbol = selected[0].split(".")[-1] if selected else ""
+        input_symbol = st.text_input(
+            "输入标的代码",
+            value=default_symbol,
+            placeholder="例如 518880 或 SHSE.518880",
+            help="输入当前数据源快照中已有的标的代码；新增标的需先在侧边栏加入标的池并获取历史数据。",
+        )
+        analysis_symbol = resolve_symbol_input(input_symbol)
+        if analysis_symbol is None:
+            st.warning("代码格式无法识别，请输入6位代码，例如 518880。")
+        elif analysis_symbol not in all_data:
+            st.error(f"{analysis_symbol} 不在当前 {data_source_label} 数据快照中，请先在侧边栏加入该标的并获取历史数据。")
+        else:
+            analysis_frame = all_data[analysis_symbol]
+            analysis_score = kingmomentum_score(analysis_frame, window=25).dropna()
+            if analysis_score.empty:
+                st.error(f"{analysis_symbol} 的历史数据不足25个交易日，无法计算动量分数。")
+            else:
+                latest_score = float(analysis_score.iloc[-1])
+                score_status = "非正分" if latest_score <= 0 else ("过热" if latest_score > 500 else "有效候选")
+                metric_cols = st.columns(4)
+                metric_cols[0].metric("标的", ASSETS.get(analysis_symbol, analysis_symbol))
+                metric_cols[1].metric("最新数据日期", analysis_frame.index.max().date().isoformat())
+                metric_cols[2].metric("最新复权收盘价", f"{float(analysis_frame['close'].iloc[-1]):.4f}")
+                metric_cols[3].metric("当前动量分数", f"{latest_score:.4f}")
+                st.info(
+                    f"当前状态：**{score_status}**。动量分数使用 {analysis_symbol} 的复权收盘价和过去25个交易日数据计算；"
+                    f"数据范围为 {analysis_frame.index.min().date()} 至 {analysis_frame.index.max().date()}。"
+                )
+                kline, score_chart = single_asset_charts(analysis_frame, analysis_symbol)
+                st.plotly_chart(kline, use_container_width=True)
+                st.plotly_chart(score_chart, use_container_width=True)
+                st.caption("K线使用当前选择数据源的复权 OHLC；动量曲线为正式历史收盘计算结果，不包含盘中模拟价格。盘中预估请使用“最新持仓”页面的模拟收盘价功能。")
 
     else:
         st.subheader("策略说明")
